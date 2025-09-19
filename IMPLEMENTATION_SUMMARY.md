@@ -90,11 +90,15 @@ Complete PostgreSQL schema implemented with:
 
 ## 🚀 Deployment Ready
 
-- ✅ Vercel configuration with cron jobs
+- ✅ Railway persistent bot with Docker
 - ✅ Environment variable management
 - ✅ Production build optimization
 - ✅ Database migration scripts
 - ✅ Comprehensive documentation
+
+### Services
+- Bot (worker + health URL): `npm run start:bot` (exposes `/health` on `PORT`)
+- Web UI (optional): `npm run start:web` (Next.js app)
 
 ## 📋 API Endpoints
 
@@ -142,11 +146,11 @@ The application is fully configurable through environment variables:
 
 The EV Tennis & Soccer Scanner is now fully implemented and ready for deployment. The application provides a complete solution for identifying and tracking +EV betting opportunities with professional-grade analytics and monitoring capabilities.
 
-### Next Steps for Deployment:
+### Next Steps for Deployment (Railway):
 1. Set up Supabase project and run schema migration
 2. Configure The Odds API account and keys
-3. Deploy to Vercel with environment variables
-4. Enable cron jobs for automated operation
+3. Deploy to Railway (Dockerfile included) with environment variables
+4. The bot handles scheduling internally; no external crons are needed
 5. Configure monitoring and alerting
 
 The system is designed to run autonomously with minimal maintenance, providing continuous value identification and performance tracking for tennis and soccer betting markets.

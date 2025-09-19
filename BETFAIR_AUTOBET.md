@@ -78,11 +78,55 @@ AUTO_BET_MIN_STAKE=2
 AUTO_BET_BANKROLL=1000
 ```
 
+## New Architecture (Railway Persistent Bot)
+
+- We run a long-lived Node process (see `bot/app.js`) on Railway.
+- On startup, the bot performs certificate login to obtain `sessionToken` and stores it in memory.
+- The bot schedules `keepAlive` every 15 minutes internally using `node-cron`.
+- If `keepAlive` fails, the bot immediately re-logins and updates the in-memory token.
+- Secrets are provided via environment variables (username, password, app key, PFX password, and PFX content/path).
+
+### Required Environment Variables
+
+```
+BETFAIR_APP_KEY=...
+BETFAIR_USERNAME=...
+BETFAIR_PASSWORD=...
+BETFAIR_PFX_PASSWORD=...
+
+# Provide either a base64-encoded PFX or a filesystem path inside the container
+BETFAIR_PFX_BASE64=...     # recommended
+# or
+BETFAIR_PFX_PATH=/app/certs/client.pfx
+
+# Optional
+KEEPALIVE_CRON=*/15 * * * *
+```
+
+### Run Locally
+
+```bash
+npm install
+npm start
+```
+
+### Deployment (Railway + Docker)
+
+- Dockerfile builds a minimal Node 20 image and runs `npm start`.
+- Configure Railway service with the environment variables above.
+- No public HTTP endpoint is required for keepAlive.
+
+### Health/Status URL (optional)
+
+- The bot now exposes a tiny HTTP server (for platforms like Railway that expect a listening port).
+- It binds to `PORT` (default 3000) and provides:
+  - `GET /health` → `{ ok: true, service: 'betfair-bot', keepAliveCron: '*/15 * * * *', hasSessionToken: true }`
+  - `GET /version` → `betfair-bot:1`
+- On Railway, you will receive a public URL. Hitting `/health` confirms the bot is live and has a session.
+
 ## Testing
 
-- Ping: `POST /api/betfair/ping` with optional `{ "sessionToken": "..." }` to validate connectivity.
-- Locate: `POST /api/betfair/locate` with `{ "candidateId": "..." }` to resolve `marketId`/`selectionId` and inspect best back price.
-- CI: `npm run test:ci` (unit tests cover odds/alerts; Betfair calls run only in server runtime with proper envs).
+- CI: `npm run test:ci` (unit tests cover odds/alerts; network calls require proper envs when executed).
 
 ## Reference
 
