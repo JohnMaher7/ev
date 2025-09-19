@@ -169,23 +169,78 @@ async function keepAlive(sessionToken) {
   return { ok: true, token: sessionToken };
 }
 
-async function main() {
-  console.log('[bot] Starting Betfair bot...');
-  let sessionToken = null;
+// --- Login orchestration with backoff/ban handling ---
+let sessionToken = null;
+const loginState = {
+  lastError: null,
+  blockedUntil: 0, // epoch ms
+  retryDelayMs: 60_000, // start at 60s
+};
+
+function ms(humanMs) {
+  return humanMs;
+}
+
+function formatDelay(msValue) {
+  const s = Math.ceil(msValue / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.ceil(s / 60);
+  return `${m}m`;
+}
+
+async function ensureLogin(trigger = 'manual') {
+  const now = Date.now();
+  if (sessionToken) return;
+  if (now < loginState.blockedUntil) {
+    const waitMs = loginState.blockedUntil - now;
+    console.warn(`[bot] Login blocked until ${new Date(loginState.blockedUntil).toISOString()} (waiting ${formatDelay(waitMs)})`);
+    return;
+  }
+
   try {
-    sessionToken = await certLogin();
+    console.log(`[bot] Attempting certLogin (trigger=${trigger})...`);
+    const token = await certLogin();
+    sessionToken = token;
     process.env.BETFAIR_SESSION_TOKEN = sessionToken;
+    loginState.lastError = null;
+    loginState.retryDelayMs = 60_000; // reset backoff
     console.log('[bot] certLogin SUCCESS');
   } catch (e) {
-    console.error('[bot] certLogin ERROR:', e.message || e);
-    process.exit(1);
+    const msg = e && e.message ? e.message : String(e);
+    loginState.lastError = msg;
+    // Handle temporary ban (rate limit) explicitly
+    if (/TEMPORARY_BAN_TOO_MANY_REQUESTS/i.test(msg)) {
+      // Betfair bans are typically short; wait 15 minutes before retrying
+      loginState.blockedUntil = Date.now() + ms(15 * 60 * 1000);
+      console.warn('[bot] TEMPORARY_BAN_TOO_MANY_REQUESTS → pausing logins for 15 minutes');
+    } else {
+      // Generic backoff (exponential up to 10 minutes)
+      const next = Math.min(loginState.retryDelayMs * 2, 10 * 60 * 1000);
+      console.warn(`[bot] certLogin failed: ${msg}. Retrying in ${formatDelay(loginState.retryDelayMs)} (max 10m)`);
+      const delay = loginState.retryDelayMs;
+      loginState.retryDelayMs = next;
+      setTimeout(() => {
+        ensureLogin('backoff');
+      }, delay);
+    }
   }
+}
+
+async function main() {
+  console.log('[bot] Starting Betfair bot...');
+  // Kick off login (non-fatal if it fails; backoff handles retries)
+  ensureLogin('startup');
 
   const scheduleExpr = process.env.KEEPALIVE_CRON || '*/15 * * * *';
   console.log(`[bot] Scheduling keepAlive: ${scheduleExpr}`);
 
   cron.schedule(scheduleExpr, async () => {
     try {
+      if (!sessionToken) {
+        console.log('[bot] keepAlive: no session token yet; attempting login');
+        await ensureLogin('keepalive-missing-token');
+        return;
+      }
       const res = await keepAlive(sessionToken);
       if (!res.ok) {
         throw new Error('keepAlive returned not ok');
@@ -197,13 +252,8 @@ async function main() {
       console.log('[bot] keepAlive ok');
     } catch (e) {
       console.warn('[bot] keepAlive failed; attempting re-login:', e.message || e);
-      try {
-        sessionToken = await certLogin();
-        process.env.BETFAIR_SESSION_TOKEN = sessionToken;
-        console.log('[bot] Re-login SUCCESS');
-      } catch (e2) {
-        console.error('[bot] Re-login ERROR:', e2.message || e2);
-      }
+      sessionToken = null;
+      await ensureLogin('keepalive-fail');
     }
   });
 
@@ -218,6 +268,8 @@ async function main() {
         service: 'betfair-bot',
         keepAliveCron: scheduleExpr,
         hasSessionToken: Boolean(sessionToken && sessionToken.length > 0),
+        loginBlockedUntil: loginState.blockedUntil ? new Date(loginState.blockedUntil).toISOString() : null,
+        lastLoginError: loginState.lastError || null,
       }));
       return;
     }
