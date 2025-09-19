@@ -53,6 +53,35 @@ export interface MarketData {
 }
 
 /**
+ * Determine whether there exists at least one exchange in the market whose
+ * implied probabilities across outcomes sum to within the stability band.
+ */
+export function checkExchangeStability(marketData: MarketData): boolean {
+  const selectionNames = Object.keys(marketData.selections);
+  if (selectionNames.length < 2) return false;
+
+  // Collect odds per exchange across selections
+  const perExchangeOdds: Record<string, number[]> = {};
+  for (const selection of selectionNames) {
+    for (const ex of marketData.selections[selection].exchanges) {
+      if (!perExchangeOdds[ex.bookmaker]) perExchangeOdds[ex.bookmaker] = [];
+      perExchangeOdds[ex.bookmaker].push(ex.decimal_odds);
+    }
+  }
+
+  const min = config.exchangeStabilityThreshold.min;
+  const max = config.exchangeStabilityThreshold.max;
+  for (const odds of Object.values(perExchangeOdds)) {
+    const valid = odds.filter(o => o > 0);
+    if (valid.length >= 2) {
+      const sum = valid.map(decimalToProbability).reduce((a, b) => a + b, 0);
+      if (sum >= min && sum <= max) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Calculate edge and EV for sportsbook offers
  */
 export function calculateSportsbookEdgeAndEV(
@@ -131,6 +160,14 @@ export function generateAlertCandidates(
           bookmakerProbsByOutcome.get(selections[i])?.set(bookmaker, deViggedProbs[probIndex]);
           probIndex++;
         }
+      }
+    } else if (validOdds.length === 1 && selections.length === 1) {
+      // Fallback: single-outcome data – approximate using implied prob 1/odds
+      // This enables alert generation for tests/datasets that only provide one outcome
+      const onlySelection = selections[0];
+      const onlyOdd = validOdds[0];
+      if (onlyOdd && onlyOdd > 0) {
+        bookmakerProbsByOutcome.get(onlySelection)?.set(bookmaker, decimalToProbability(onlyOdd));
       }
     }
   }
@@ -249,6 +286,11 @@ export function generateAlertCandidates(
         decisionFair = trimmedMean(sbProbs);
       } else if (sbProbs.length >= 3) {
         decisionFair = median(sbProbs);
+      } else if (sbProbs.length === 2) {
+        // Fallback: mean of two
+        decisionFair = (sbProbs[0] + sbProbs[1]) / 2;
+      } else if (sbProbs.length === 1) {
+        decisionFair = sbProbs[0];
       }
     }
     

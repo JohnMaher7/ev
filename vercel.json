@@ -7,6 +7,10 @@
     {
       "path": "/api/poll",
       "schedule": "0 8-22 * * *"
+    },
+    {
+      "path": "/api/betfair/keepalive",
+      "schedule": "0 * * * *"
     }
   ]
 }

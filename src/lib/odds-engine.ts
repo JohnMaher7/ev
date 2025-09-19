@@ -3,7 +3,7 @@
  * Uses the new modular approach with prob.ts, consensus.ts, and alerts.ts
  */
 
-import { generateAlertCandidates, type MarketData } from './alerts';
+import { generateAlertCandidates, type MarketData, calculateSportsbookEdgeAndEV } from './alerts';
 
 export interface OddsSnapshot {
   event_id: string;
@@ -35,7 +35,8 @@ export {
   calculateFairProbability
 } from './consensus';
 export { 
-  generateAlertCandidates
+  generateAlertCandidates,
+  calculateSportsbookEdgeAndEV
 } from './alerts';
 
 
