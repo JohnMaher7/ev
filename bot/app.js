@@ -118,6 +118,39 @@ function requireEnvs(required) {
   }
 }
 
+function resolveSsoEndpoints() {
+  const j = (process.env.BETFAIR_JURISDICTION || 'GLOBAL').toUpperCase();
+  switch (j) {
+    case 'AUS':
+    case 'AU':
+    case 'ANZ':
+      return {
+        certLogin: 'https://identitysso-cert.betfair.com.au/api/certlogin',
+        keepAlive: 'https://identitysso.betfair.com.au/api/keepAlive',
+      };
+    case 'IT':
+      return {
+        certLogin: 'https://identitysso-cert.betfair.it/api/certlogin',
+        keepAlive: 'https://identitysso.betfair.it/api/keepAlive',
+      };
+    case 'ES':
+      return {
+        certLogin: 'https://identitysso-cert.betfair.es/api/certlogin',
+        keepAlive: 'https://identitysso.betfair.es/api/keepAlive',
+      };
+    case 'RO':
+      return {
+        certLogin: 'https://identitysso-cert.betfair.ro/api/certlogin',
+        keepAlive: 'https://identitysso.betfair.ro/api/keepAlive',
+      };
+    default:
+      return {
+        certLogin: 'https://identitysso-cert.betfair.com/api/certlogin',
+        keepAlive: 'https://identitysso.betfair.com/api/keepAlive',
+      };
+  }
+}
+
 async function certLogin() {
   const appKey = process.env.BETFAIR_APP_KEY;
   const username = process.env.BETFAIR_USERNAME;
@@ -131,8 +164,9 @@ async function certLogin() {
     'X-Application': appKey,
   };
 
+  const { certLogin } = resolveSsoEndpoints();
   const { statusCode, body } = await postFormWithClientCert(
-    'https://identitysso-cert.betfair.com/api/certlogin',
+    certLogin,
     { username, password },
     pfx,
     pfxPass,
@@ -154,7 +188,8 @@ async function keepAlive(sessionToken) {
   if (!appKey || !sessionToken) {
     throw new Error('keepAlive missing appKey or sessionToken');
   }
-  const { statusCode, body } = await postJson('https://identitysso.betfair.com/api/keepAlive', {
+  const { keepAlive } = resolveSsoEndpoints();
+  const { statusCode, body } = await postJson(keepAlive, {
     'X-Application': appKey,
     'X-Authentication': sessionToken,
   });
