@@ -97,8 +97,8 @@ Complete PostgreSQL schema implemented with:
 - ✅ Comprehensive documentation
 
 ### Services
-- Bot (worker + health URL): `npm run start:bot` (exposes `/health` on `PORT`)
-- Web UI (optional): `npm run start:web` (Next.js app)
+- Web UI & Alerts (Vercel): Next.js app with scheduled discovery/poll.
+- Betfair Bot (UK VPS): Node app `bot/app.js` with health `/health`.
 
 ## 📋 API Endpoints
 
@@ -146,11 +146,11 @@ The application is fully configurable through environment variables:
 
 The EV Tennis & Soccer Scanner is now fully implemented and ready for deployment. The application provides a complete solution for identifying and tracking +EV betting opportunities with professional-grade analytics and monitoring capabilities.
 
-### Next Steps for Deployment (Railway):
+### Next Steps for Deployment
 1. Set up Supabase project and run schema migration
 2. Configure The Odds API account and keys
-3. Deploy to Railway (Dockerfile included) with environment variables
-4. The bot handles scheduling internally; no external crons are needed
-5. Configure monitoring and alerting
+3. Deploy UI to Vercel; set envs; confirm cron runs for discovery/poll
+4. Deploy bot to UK VPS; set envs via `.env.bot`; confirm `/health` and cert login
+5. Monitor logs/metrics and refine thresholds
 
 The system is designed to run autonomously with minimal maintenance, providing continuous value identification and performance tracking for tennis and soccer betting markets.

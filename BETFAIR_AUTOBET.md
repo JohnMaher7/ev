@@ -78,13 +78,11 @@ AUTO_BET_MIN_STAKE=2
 AUTO_BET_BANKROLL=1000
 ```
 
-## New Architecture (Railway Persistent Bot)
+## New Architecture (Vercel UI + UK VPS Bot)
 
-- We run a long-lived Node process (see `bot/app.js`) on Railway.
-- On startup, the bot performs certificate login to obtain `sessionToken` and stores it in memory.
-- The bot schedules `keepAlive` every 15 minutes internally using `node-cron`.
-- If `keepAlive` fails, the bot immediately re-logins and updates the in-memory token.
-- Secrets are provided via environment variables (username, password, app key, PFX password, and PFX content/path).
+- UI & Alerts Engine runs on Vercel (Next.js). It polls The Odds API on schedule and serves the dashboard.
+- Betfair Bot runs on a UK VPS (Node, `bot/app.js`). It logs in with client cert, keeps the session alive, subscribes to `candidates` via Supabase realtime, re-validates prices/edge, and places exchange orders.
+- The two services communicate asynchronously via Supabase tables.
 
 ### Required Environment Variables
 
@@ -110,19 +108,18 @@ npm install
 npm start
 ```
 
-### Deployment (Railway + Docker)
+### Deployment
 
-- Dockerfile builds a minimal Node 20 image and runs `npm start`.
-- Configure Railway service with the environment variables above.
-- No public HTTP endpoint is required for keepAlive.
+- Vercel (UI): set envs in the Vercel dashboard. `vercel.json` configures cron for `/api/discovery` and `/api/poll`.
+- VPS Bot: use `bot/Dockerfile` (or Node directly). Provide envs via an `.env.bot` on the VPS and run the container with `--env-file`.
 
-### Health/Status URL (optional)
+### Bot Health/Status URL (optional)
 
 - The bot now exposes a tiny HTTP server (for platforms like Railway that expect a listening port).
 - It binds to `PORT` (default 3000) and provides:
   - `GET /health` → `{ ok: true, service: 'betfair-bot', keepAliveCron: '*/15 * * * *', hasSessionToken: true }`
   - `GET /version` → `betfair-bot:1`
-- On Railway, you will receive a public URL. Hitting `/health` confirms the bot is live and has a session.
+- On the VPS, expose port 3000 if needed. Hitting `/health` confirms the bot is live and has a session.
 
 ## Testing
 
