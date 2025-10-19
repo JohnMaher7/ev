@@ -105,19 +105,16 @@ export class OddsApiClient {
   }
 
   /**
-   * Get odds for tennis
+   * Get odds for any sport with bookmaker allowlist applied
+   * Use this generic method instead of sport-specific wrappers
+   * 
+   * @param sport - Sport key from The Odds API (e.g., 'tennis_atp_us_open', 'soccer_efl_champ', 'darts_pdc_world_champs')
+   * @param regions - Region code, defaults to 'uk'
+   * @param markets - Market types, defaults to 'h2h,totals'
    */
-  async getTennisOdds(): Promise<OddsApiEvent[]> {
+  async getOddsWithAllowlist(sport: string, regions: string = 'uk', markets: string = 'h2h,totals'): Promise<OddsApiEvent[]> {
     const bookmakers = config.bookmakerAllowlist.join(',');
-    return this.getOdds('tennis', 'uk', 'h2h,totals', 'decimal', 'iso', bookmakers);
-  }
-
-  /**
-   * Get odds for soccer
-   */
-  async getSoccerOdds(): Promise<OddsApiEvent[]> {
-    const bookmakers = config.bookmakerAllowlist.join(',');
-    return this.getOdds('soccer_epl', 'uk', 'h2h,totals', 'decimal', 'iso', bookmakers);
+    return this.getOdds(sport, regions, markets, 'decimal', 'iso', bookmakers);
   }
 
   /**

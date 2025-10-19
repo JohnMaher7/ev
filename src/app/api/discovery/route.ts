@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { oddsApiClient, convertOddsApiToSnapshots, convertOddsApiToEvents } from '@/lib/odds-api';
+import { oddsApiClient } from '@/lib/odds-api';
 import { supabaseAdmin } from '@/lib/supabase';
 import { config } from '@/lib/config';
+import { shouldEnableSport } from '@/lib/utils';
 
-export async function POST(request: NextRequest) {
+export async function POST(_request: NextRequest) {
   try {
     if (config.demoMode) {
       return NextResponse.json({
@@ -11,112 +12,60 @@ export async function POST(request: NextRequest) {
         message: 'Demo mode - discovery skipped',
         data: {
           sports: [],
-          events: [],
-          snapshots: [],
+          sportsEnabled: 0,
         },
       });
     }
 
     // Get all sports from The Odds API
     const sports = await oddsApiClient.getSports();
+    console.log(`🔍 Discovery: Found ${sports.length} total sports from API`);
     
-    // Filter for tennis and soccer
-    const targetSports = sports.filter(sport => 
-      sport.key === 'tennis' || 
-      sport.key.startsWith('soccer_')
-    );
+    // Filter for target sports using centralized logic
+    const targetSports = sports.filter(sport => shouldEnableSport(sport.key));
+    console.log(`✅ Discovery: ${targetSports.length} sports match our criteria`);
+    
+    let enabledCount = 0;
 
-    // Store/update sports in database
+    // Store/update sports in database with enabled flag
     for (const sport of targetSports) {
       const { error } = await supabaseAdmin!
         .from('sports')
         .upsert({
           sport_key: sport.key,
           sport_title: sport.title,
-          enabled: sport.key === 'tennis' || 
-                   sport.key === 'tennis_atp_us_open' || 
-                   sport.key === 'tennis_wta_us_open' ||
-                   sport.key === 'soccer_england_league1' ||
-                   sport.key === 'soccer_england_league2' ||
-                   sport.key === 'soccer_efl_champ' ||
-                   sport.key === 'soccer_league_of_ireland' ||
-                   sport.key === 'soccer_denmark_superliga' ||
-                   sport.key === 'soccer_norway_eliteserien' ||
-                   sport.key === 'soccer_sweden_allsvenskan', // Enable tennis tournaments and low-grade soccer leagues
+          enabled: true, // All matched sports are enabled
         }, {
           onConflict: 'sport_key'
         });
 
       if (error) {
-        console.error(`Error upserting sport ${sport.key}:`, error);
+        console.error(`❌ Error upserting sport ${sport.key}:`, error);
+      } else {
+        enabledCount++;
+        console.log(`✓ Enabled: ${sport.key} (${sport.title})`);
       }
     }
 
-    // Get events for enabled sports
-    const allEvents: any[] = [];
-    const allSnapshots: any[] = [];
+    // Disable sports that no longer match our criteria
+    const targetKeys = targetSports.map(s => s.key);
+    if (targetKeys.length > 0) {
+      const { error: disableError } = await supabaseAdmin!
+        .from('sports')
+        .update({ enabled: false })
+        .not('sport_key', 'in', `(${targetKeys.map(k => `'${k}'`).join(',')})`);
 
-    for (const sport of targetSports) {
-      if (sport.key === 'tennis') {
-        try {
-          const events = await oddsApiClient.getTennisOdds();
-          allEvents.push(...events);
-          
-          // Convert to snapshots
-          const snapshots = convertOddsApiToSnapshots(events);
-          allSnapshots.push(...snapshots);
-        } catch (error) {
-          console.error('Error fetching tennis odds:', error);
-        }
-      } else if (sport.key === 'soccer_epl') {
-        try {
-          const events = await oddsApiClient.getSoccerOdds();
-          allEvents.push(...events);
-          
-          // Convert to snapshots
-          const snapshots = convertOddsApiToSnapshots(events);
-          allSnapshots.push(...snapshots);
-        } catch (error) {
-          console.error('Error fetching soccer odds:', error);
-        }
-      }
-    }
-
-    // Store events in database
-    if (allEvents.length > 0) {
-      const eventsToStore = convertOddsApiToEvents(allEvents);
-      
-      for (const event of eventsToStore) {
-        const { error } = await supabaseAdmin!
-          .from('events')
-          .upsert(event, {
-            onConflict: 'event_id'
-          });
-
-        if (error) {
-          console.error(`Error upserting event ${event.event_id}:`, error);
-        }
-      }
-    }
-
-    // Store snapshots in database
-    if (allSnapshots.length > 0) {
-      const { error } = await supabaseAdmin!
-        .from('odds_snapshots')
-        .insert(allSnapshots);
-
-      if (error) {
-        console.error('Error inserting snapshots:', error);
+      if (disableError) {
+        console.error('❌ Error disabling outdated sports:', disableError);
       }
     }
 
     return NextResponse.json({
       success: true,
-      message: 'Discovery completed successfully',
+      message: `Discovery completed: ${enabledCount} sports enabled`,
       data: {
-        sports: targetSports,
-        events: allEvents.length,
-        snapshots: allSnapshots.length,
+        sports: targetSports.map(s => ({ key: s.key, title: s.title })),
+        sportsEnabled: enabledCount,
       },
     });
 

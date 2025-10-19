@@ -1,22 +1,36 @@
 # EV Tennis & Soccer Scanner
 
-A minimal web application for identifying +EV betting opportunities in tennis and soccer markets using The Odds API.
+EV Scanner is a modern web application for identifying +EV betting opportunities in tennis and soccer markets. The interface is optimised for speed, clarity, and professional use by traders.
 
-## Features
+## Product Overview
 
-- **Real-time Odds Monitoring**: Polls The Odds API every hour during active hours (08:00-22:00 Europe/London)
-- **Fair Probability Calculation**: Robust consensus calculation using sportsbook and exchange data
-- **Alert System**: Three-tier alert system (SOLID, SCOUT, EXCHANGE VALUE) with configurable thresholds
-- **Bet Tracking**: Log bets, track performance, and calculate CLV (Closing Line Value)
-- **Performance Analytics**: Comprehensive dashboard with P&L tracking, win rates, and margin analysis
-- **Admin Panel**: Monitor system health, API usage, and manual operations
+- **Live Alerts** – Real-time view of profitable opportunities with tier badges, implied edge, and contextual metadata.
+- **Bet Ledger** – Settled vs. pending bet tracking including automatic ROI and P&L calculations.
+- **Analytics** – Multi-chart performance dashboard covering realised vs expected returns, CLV, and volume trends.
+- **Operations Console** – Health monitoring for ingestion jobs with manual discovery/poll triggers and configuration insight.
+
+## Design System
+
+| Token | Dark Hex | Light Hex | Usage |
+| --- | --- | --- | --- |
+| `--color-app-bg` | `#050914` | `#f1f5f9` | Root background |
+| `--color-card` | `#0f1b33` | `#ffffff` | Cards/content surfaces |
+| `--color-border` | `rgba(148,163,184,.16)` | `rgba(148,163,184,.35)` | Divider/border accents |
+| `--color-text-primary` | `#e2e8f0` | `#0f172a` | Primary copy |
+| Accents | `#14b8a6`, `#38bdf8`, `#f87171`, `#facc15` | same | Tier, status, focus states |
+
+- **Typography** – Geist Sans & Mono (via Next fonts). Titles use 600 weight, data figures use mono to improve scanability.
+- **Spacing** – 4/8/12/16/24px scale with generous padding inside cards to reduce visual noise.
+- **Elevation** – `shadow-card` for primary panels, increases subtly on hover for interactive affordance.
 
 ## Tech Stack
 
-- **Frontend**: Next.js 15 (App Router), React Query, Tailwind CSS, Recharts
-- **Backend**: Next.js API Routes, Supabase (PostgreSQL)
-- **Deployment**: Vercel with cron jobs
-- **Data Source**: The Odds API
+- **Framework**: Next.js 15 App Router with React Server Components.
+- **Data Layer**: API Routes backed by Supabase (PostgreSQL) and The Odds API.
+- **Client State**: TanStack React Query 5 (global QueryClient in `src/app/providers.tsx`).
+- **Styling**: Tailwind CSS v4 (utility-first) with custom design tokens.
+- **Visualisation**: Recharts, dynamically imported per route for bundle splitting.
+- **Deployment**: Vercel with scheduled cron triggers for discovery/poll routines.
 
 ## Setup
 
@@ -63,34 +77,37 @@ npm install
 npm run dev
 ```
 
-## Alert System
+Visit `http://localhost:3000/alerts` to access the alerts view. The root route redirects there automatically.
 
-### SOLID Alerts
-- **Requirements**: ≥3 books OR (2 books AND ≥1 stable exchange)
-- **Threshold**: ≥2.0 percentage points edge
-- **Stake**: 25% Kelly with 2% bank cap
-- **Purpose**: High-confidence value bets
+## Core Screens
 
-### SCOUT Alerts
-- **Requirements**: ≥2 books (exchanges optional)
-- **Threshold**: ≥5.0 percentage points edge
-- **Stake**: Fixed 0.5% bank cap
-- **Purpose**: Early line arbitrage opportunities
+### Alerts (`/alerts`)
+- Macrotile layout with summary cards (active count, average edge, tier mix).
+- Filters: Minimum edge input (manual apply), tier dropdown, market dropdown.
+- Wide grid removing horizontal scroll, quick actions for “Bet” modal or clearing entries.
 
-### EXCHANGE VALUE Alerts
-- **Requirements**: ≥3 books AND ≥1 stable exchange
-- **Threshold**: ≥3.0 percentage points advantage on exchange
-- **Stake**: Same as SOLID
-- **Purpose**: Exchange vs sportsbook value
+### Bets (`/bets`)
+- Settlement-aware ledger with inline status updates and derived metrics (total staked/P&L).
+- Status filter with cached pagination, preventing re-fetch until applied.
 
-## API Endpoints
+### Performance (`/metrics`)
+- Lazy-loaded charts comparing actual vs expected P&L, ROI, CLV, and volume per tier.
+- Data refreshes every 60s with background loading so charts remain visible.
 
-- `POST /api/discovery` - Run sports discovery and initial data collection
-- `POST /api/poll` - Poll for new odds and generate alerts
-- `GET /api/candidates` - Get alert candidates with filters
-- `POST /api/bets` - Log a new bet
-- `POST /api/bets/[id]/settle` - Settle a bet (win/loss/void)
-- `GET /api/metrics` - Get performance metrics and KPIs
+### Operations (`/admin`)
+- Health cards for snapshots, candidates, API usage, error rate.
+- Manual controls for discovery/poll worker jobs, system configuration snapshot, event audit trail.
+
+## Data & API Endpoints
+
+- `POST /api/discovery` – Trigger daily sports discovery and bootstrap data.
+- `POST /api/poll` – Hourly odds polling and alert generation.
+- `GET /api/candidates` – Alerts feed, supports `min_edge` and `alert_tier` filtering.
+- `DELETE /api/candidates/:id` – Remove a single alert.
+- `DELETE /api/candidates/clear-all` – Purge active alerts (admin only).
+- `POST /api/bets` – Log a new bet execution.
+- `POST /api/bets/[id]/settle` – Update bet status with returns/P&L.
+- `GET /api/metrics` – Aggregated performance dataset for dashboards.
 
 ## Cron Jobs
 
@@ -123,7 +140,7 @@ npm run dev
 
 ```bash
 npm run build
-npm start
+npm run start:web
 ```
 
 ### Testing
@@ -132,19 +149,45 @@ npm start
 npm run test
 ```
 
+### Bundle Analysis (optional)
+
+Add the analyzer as a dev dependency:
+
+```bash
+npm install --save-dev @next/bundle-analyzer
+```
+
+Wrap `next.config.ts`:
+
+```ts
+const withBundleAnalyzer = require("@next/bundle-analyzer")({ enabled: process.env.ANALYZE === "true" });
+
+module.exports = withBundleAnalyzer({
+  experimental: { turbotrace: true },
+});
+```
+
+Run:
+
+```bash
+ANALYZE=true npm run build
+```
+
+Inspect the generated report to find heavy modules and confirm route-based splitting.
+
 ## Deployment
 
 1. Connect your repository to Vercel
 2. Set up environment variables in Vercel dashboard
 3. Deploy - cron jobs will be automatically configured
 
-## Monitoring
+## Monitoring & Operations
 
-Use the Admin panel to:
-- Monitor API call counts and errors
-- View system health and last operation times
-- Manually trigger discovery and polling
-- Check sports configuration and thresholds
+Use the Operations screen to:
+- Monitor API call counts, errors, and substrate success rate.
+- Inspect current config (timezone, poll interval, thresholds).
+- Review latest discovery/poll timestamps and activity log.
+- Run discovery/poll manually when debugging or replaying data.
 
 ## License
 

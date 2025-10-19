@@ -19,7 +19,7 @@ export const config = {
   
   // Alert thresholds
   alertThresholds: {
-    solid: 0.001, // 2 percentage points
+    solid: 0.02, // 2 percentage points
     scout: 0.05, // 5 percentage points
     exchangeValue: 0.03, // 3 percentage points
   },
@@ -45,7 +45,7 @@ export const config = {
   autoBet: {
     enabled: process.env.AUTO_BET_ENABLED === 'true',
     exchangeKey: 'betfair_ex_uk' as const,
-    minEdge: parseFloat(process.env.AUTO_BET_MIN_EDGE || '0.008'), // 0.8 percentage points
+    minEdge: parseFloat(process.env.AUTO_BET_MIN_EDGE || '0.03'), // 3 percentage points (higher than alert threshold)
     minStake: parseFloat(process.env.AUTO_BET_MIN_STAKE || '2'), // currency units
     bankroll: parseFloat(process.env.AUTO_BET_BANKROLL || '1000'), // currency units
   },
