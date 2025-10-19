@@ -9,10 +9,13 @@ import { v4 as uuidv4 } from 'uuid';
 
 export async function POST(_request: NextRequest) {
   try {
+    console.log('📊 Poll: Starting poll cycle...');
+
     if (config.demoMode) {
+      console.log('⏭️ Poll: Demo mode enabled - skipping operations');
       return NextResponse.json({
         success: true,
-        message: 'Demo mode - polling skipped',
+        message: 'Demo mode is enabled. Polling skipped.',
         data: {
           events: 0,
           snapshots: 0,
@@ -23,6 +26,7 @@ export async function POST(_request: NextRequest) {
 
     // Check if Supabase is available
     if (!supabaseAdmin) {
+      console.error('❌ Poll: Supabase not configured');
       return NextResponse.json({
         success: false,
         error: 'Supabase not configured - please add SUPABASE_SERVICE_ROLE_KEY to your environment variables',
@@ -36,13 +40,15 @@ export async function POST(_request: NextRequest) {
       .eq('enabled', true);
 
     if (sportsError) {
+      console.error('❌ Poll: Error fetching sports:', sportsError.message);
       throw new Error(`Error fetching enabled sports: ${sportsError.message}`);
     }
 
     if (!enabledSports || enabledSports.length === 0) {
+      console.log('ℹ️ Poll: No enabled sports found in database');
       return NextResponse.json({
         success: true,
-        message: 'No enabled sports found',
+        message: 'No enabled sports found. Run Discovery first to set up sports.',
         data: {
           events: 0,
           snapshots: 0,
@@ -299,9 +305,13 @@ export async function POST(_request: NextRequest) {
     console.log(`  • Alerts generated: ${allCandidates.length}`);
     console.log(`  • API calls saved: ~${apiCallsSaved} (smart filtering)`);
 
+    const message = allEvents.length > 0 
+      ? `Poll completed: ${allEvents.length} events, ${allSnapshots.length} snapshots, ${allCandidates.length} alerts generated`
+      : `Poll completed: No events found for ${enabledSports.length} enabled sports`;
+
     return NextResponse.json({
       success: true,
-      message: `Polling completed: ${allEvents.length} events, ${allCandidates.length} alerts`,
+      message,
       data: {
         events: allEvents.length,
         eventsSkipped,

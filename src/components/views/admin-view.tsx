@@ -8,6 +8,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { EmptyState } from "@/components/ui/empty-state";
 import { SummaryCard } from "@/components/ui/summary-card";
 import { cn, formatDateTime } from "@/lib/utils";
+import { useToast } from "@/components/ui/toast";
 
 interface AdminStats {
   sports: Array<{ sport_key: string; sport_title: string; enabled: boolean }>;
@@ -31,6 +32,7 @@ export default function AdminView() {
   const [isRunningDiscovery, setIsRunningDiscovery] = useState(false);
   const [isRunningPoll, setIsRunningPoll] = useState(false);
   const queryClient = useQueryClient();
+  const { showToast } = useToast();
 
   const { data: stats, isLoading } = useQuery<AdminStats>({
     queryKey: ["admin-stats"],
@@ -60,13 +62,23 @@ export default function AdminView() {
     mutationFn: async () => {
       const response = await fetch("/api/discovery", { method: "POST" });
       if (!response.ok) {
-        throw new Error("Discovery failed");
+        const errorData = await response.json().catch(() => ({ error: "Discovery failed" }));
+        throw new Error(errorData.error || "Discovery failed");
       }
       return response.json();
     },
-    onSuccess: () => {
+    onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ["admin-stats"] });
       queryClient.invalidateQueries({ queryKey: ["candidates"] });
+      
+      // Show success toast with the message from the API
+      if (data.message) {
+        const hasData = data.data?.sportsEnabled > 0;
+        showToast(data.message, hasData ? "success" : "info");
+      }
+    },
+    onError: (error: Error) => {
+      showToast(`Discovery failed: ${error.message}`, "error");
     },
   });
 
@@ -74,13 +86,23 @@ export default function AdminView() {
     mutationFn: async () => {
       const response = await fetch("/api/poll", { method: "POST" });
       if (!response.ok) {
-        throw new Error("Polling failed");
+        const errorData = await response.json().catch(() => ({ error: "Polling failed" }));
+        throw new Error(errorData.error || "Polling failed");
       }
       return response.json();
     },
-    onSuccess: () => {
+    onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ["admin-stats"] });
       queryClient.invalidateQueries({ queryKey: ["candidates"] });
+      
+      // Show success toast with the message from the API
+      if (data.message) {
+        const hasData = data.data?.events > 0 || data.data?.candidates > 0;
+        showToast(data.message, hasData ? "success" : "info");
+      }
+    },
+    onError: (error: Error) => {
+      showToast(`Polling failed: ${error.message}`, "error");
     },
   });
 

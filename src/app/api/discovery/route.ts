@@ -6,10 +6,13 @@ import { shouldEnableSport } from '@/lib/utils';
 
 export async function POST(_request: NextRequest) {
   try {
+    console.log('🔍 Discovery: Starting sports discovery...');
+
     if (config.demoMode) {
+      console.log('⏭️ Discovery: Demo mode enabled - skipping operations');
       return NextResponse.json({
         success: true,
-        message: 'Demo mode - discovery skipped',
+        message: 'Demo mode is enabled. Discovery skipped.',
         data: {
           sports: [],
           sportsEnabled: 0,
@@ -18,6 +21,7 @@ export async function POST(_request: NextRequest) {
     }
 
     // Get all sports from The Odds API
+    console.log('🔍 Discovery: Fetching sports from The Odds API...');
     const sports = await oddsApiClient.getSports();
     console.log(`🔍 Discovery: Found ${sports.length} total sports from API`);
     
@@ -28,6 +32,7 @@ export async function POST(_request: NextRequest) {
     let enabledCount = 0;
 
     // Store/update sports in database with enabled flag
+    console.log(`🔍 Discovery: Upserting ${targetSports.length} sports to database...`);
     for (const sport of targetSports) {
       const { error } = await supabaseAdmin!
         .from('sports')
@@ -50,6 +55,7 @@ export async function POST(_request: NextRequest) {
     // Disable sports that no longer match our criteria
     const targetKeys = targetSports.map(s => s.key);
     if (targetKeys.length > 0) {
+      console.log(`🔍 Discovery: Disabling sports that no longer match criteria...`);
       const { error: disableError } = await supabaseAdmin!
         .from('sports')
         .update({ enabled: false })
@@ -60,9 +66,11 @@ export async function POST(_request: NextRequest) {
       }
     }
 
+    console.log(`✅ Discovery: Complete! ${enabledCount} sports enabled`);
+
     return NextResponse.json({
       success: true,
-      message: `Discovery completed: ${enabledCount} sports enabled`,
+      message: `Discovery completed: ${enabledCount} sports enabled. You can now run Poll to fetch odds.`,
       data: {
         sports: targetSports.map(s => ({ key: s.key, title: s.title })),
         sportsEnabled: enabledCount,
