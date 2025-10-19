@@ -183,7 +183,10 @@ export default function MetricsView() {
               <YAxis stroke="var(--color-text-faint)" tickLine={false} axisLine={false} />
               <Tooltip
                 contentStyle={{ background: "rgba(14,23,42,0.95)", borderRadius: "12px", border: "1px solid rgba(148,163,184,0.2)", color: "#e2e8f0" }}
-                formatter={(value: number, name: string) => [formatCurrency(value), name === "pnl" ? "Actual P&L" : "Expected Value"]}
+                formatter={(value) => {
+                  const numValue = typeof value === 'number' ? value : parseFloat(String(value));
+                  return [formatCurrency(numValue), ""];
+                }}
               />
               <Line type="monotone" dataKey="pnl" stroke="#f87171" strokeWidth={2} dot={false} name="Actual P&L" />
               <Line type="monotone" dataKey="expectedValue" stroke="#10b981" strokeWidth={2} dot={false} name="Expected Value" />
@@ -206,7 +209,10 @@ export default function MetricsView() {
                 <YAxis stroke="var(--color-text-faint)" tickLine={false} axisLine={false} />
                 <Tooltip
                   contentStyle={{ background: "rgba(14,23,42,0.95)", borderRadius: "12px", border: "1px solid rgba(148,163,184,0.2)", color: "#e2e8f0" }}
-                  formatter={(value: number, name: string) => [`${value.toFixed(2)}%`, name === "actualMargin" ? "Actual Margin" : "Expected Margin"]}
+                  formatter={(value) => {
+                    const numValue = typeof value === 'number' ? value : parseFloat(String(value));
+                    return [`${numValue.toFixed(2)}%`, ""];
+                  }}
                 />
                 <Line type="monotone" dataKey="actualMargin" stroke="#38bdf8" strokeWidth={2} dot={false} name="Actual Margin" />
                 <Line type="monotone" dataKey="expectedMargin" stroke="#facc15" strokeWidth={2} dot={false} name="Expected Margin" />
@@ -228,7 +234,10 @@ export default function MetricsView() {
                 <YAxis stroke="var(--color-text-faint)" tickLine={false} axisLine={false} />
                 <Tooltip
                   contentStyle={{ background: "rgba(14,23,42,0.95)", borderRadius: "12px", border: "1px solid rgba(148,163,184,0.2)", color: "#e2e8f0" }}
-                  formatter={(value: number) => [formatCurrency(value), "Staked"]}
+                  formatter={(value) => {
+                    const numValue = typeof value === 'number' ? value : parseFloat(String(value));
+                    return [formatCurrency(numValue), ""];
+                  }}
                 />
                 <Bar dataKey="staked" fill="#38bdf8" radius={[4, 4, 0, 0]} />
               </BarChart>
@@ -250,7 +259,7 @@ export default function MetricsView() {
               <YAxis stroke="var(--color-text-faint)" tickLine={false} axisLine={false} allowDecimals={false} />
               <Tooltip
                 contentStyle={{ background: "rgba(14,23,42,0.95)", borderRadius: "12px", border: "1px solid rgba(148,163,184,0.2)", color: "#e2e8f0" }}
-                formatter={(value: number) => [value, "Bets"]}
+                formatter={(value) => [String(value), ""]}
               />
               <Bar dataKey="count" fill="#14b8a6" radius={[4, 4, 0, 0]} />
             </BarChart>

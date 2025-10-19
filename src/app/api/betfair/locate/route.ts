@@ -8,6 +8,39 @@ type JsonRpcRequest = {
   id: number;
 };
 
+type BetfairEventType = {
+  eventType: { id: string; name: string };
+  marketCount: number;
+};
+
+type BetfairRunner = {
+  selectionId: number;
+  runnerName: string;
+  handicap?: number;
+};
+
+type BetfairMarketCatalogue = {
+  marketId: string;
+  marketName: string;
+  runners?: BetfairRunner[];
+};
+
+type BetfairRunnerBook = {
+  selectionId: number;
+  status: string;
+  ex?: {
+    availableToBack?: Array<{ price: number; size: number }>;
+    availableToLay?: Array<{ price: number; size: number }>;
+  };
+};
+
+type BetfairMarketBook = {
+  marketId: string;
+  isMarketDataDelayed: boolean;
+  status: string;
+  runners?: BetfairRunnerBook[];
+};
+
 async function betfairRpc<T>(appKey: string, sessionToken: string, method: string, params: Record<string, unknown>): Promise<T> {
   const payload: JsonRpcRequest[] = [{ jsonrpc: '2.0', method, params, id: 1 }];
   const res = await fetch('https://api.betfair.com/exchange/betting/json-rpc/v1', {
@@ -89,8 +122,8 @@ export async function POST(request: NextRequest) {
     if (!sportName) {
       return NextResponse.json({ success: false, error: `Unsupported sport_key: ${c.sport_key}` }, { status: 400 });
     }
-    const eventTypes = await betfairRpc<any[]>(appKey, token, 'SportsAPING/v1.0/listEventTypes', { filter: {} });
-    const eventType = eventTypes.find((et: any) => et.eventType?.name === sportName);
+    const eventTypes = await betfairRpc<BetfairEventType[]>(appKey, token, 'SportsAPING/v1.0/listEventTypes', { filter: {} });
+    const eventType = eventTypes.find((et) => et.eventType?.name === sportName);
     if (!eventType) {
       return NextResponse.json({ success: false, error: `Betfair event type not found: ${sportName}` }, { status: 404 });
     }
@@ -108,7 +141,7 @@ export async function POST(request: NextRequest) {
       textQuery: `${c.events.home} ${c.events.away}`,
     };
 
-    const catalogues = await betfairRpc<any[]>(appKey, token, 'SportsAPING/v1.0/listMarketCatalogue', {
+    const catalogues = await betfairRpc<BetfairMarketCatalogue[]>(appKey, token, 'SportsAPING/v1.0/listMarketCatalogue', {
       filter,
       maxResults: 50,
       marketProjection: ['RUNNER_DESCRIPTION'],
@@ -130,9 +163,9 @@ export async function POST(request: NextRequest) {
       return c.selection;
     })();
 
-    let chosen: any | null = null;
+    let chosen: { marketId: string; runner: BetfairRunner } | null = null;
     for (const m of catalogues) {
-      const rn: any[] = m.runners || [];
+      const rn = m.runners || [];
       const hit = rn.find(r => r.runnerName === wantedRunnerName);
       if (hit) { chosen = { marketId: m.marketId, runner: hit }; break; }
     }
@@ -146,12 +179,12 @@ export async function POST(request: NextRequest) {
     }
 
     // Fetch live prices for confirmation
-    const books = await betfairRpc<any[]>(appKey, token, 'SportsAPING/v1.0/listMarketBook', {
+    const books = await betfairRpc<BetfairMarketBook[]>(appKey, token, 'SportsAPING/v1.0/listMarketBook', {
       marketIds: [chosen.marketId],
       priceProjection: { priceData: ['EX_BEST_OFFERS'] },
     });
     const marketBook = books[0];
-    const rb = (marketBook?.runners || []).find((r: any) => r.selectionId === chosen.runner.selectionId);
+    const rb = (marketBook?.runners || []).find((r) => r.selectionId === chosen.runner.selectionId);
     const bestToBack = rb?.ex?.availableToBack?.[0] || null;
 
     return NextResponse.json({

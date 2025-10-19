@@ -146,7 +146,7 @@ export function convertOddsApiToSnapshots(events: OddsApiEvent[]): Array<{
   selection: string;
   decimal_odds: number;
   point?: number;
-  raw: any;
+  raw: unknown;
 }> {
   const snapshots: Array<{
     event_id: string;
@@ -157,7 +157,7 @@ export function convertOddsApiToSnapshots(events: OddsApiEvent[]): Array<{
     selection: string;
     decimal_odds: number;
     point?: number;
-    raw: any;
+    raw: unknown;
   }> = [];
 
   const now = new Date().toISOString();

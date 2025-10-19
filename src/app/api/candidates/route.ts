@@ -116,7 +116,7 @@ export async function GET(request: NextRequest) {
         }
 
         // Group by bookmaker and find best price
-        const bookmakerPrices = snapshots.reduce((acc: any, snapshot) => {
+        const bookmakerPrices = snapshots.reduce((acc: Record<string, { bookmaker: string; price: number; isExchange: boolean }>, snapshot) => {
           if (!acc[snapshot.bookmaker]) {
             acc[snapshot.bookmaker] = {
               bookmaker: snapshot.bookmaker,

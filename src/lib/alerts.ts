@@ -8,10 +8,7 @@ import {
   applyExchangeCommission
 } from './prob';
 import { 
-  calculateSportsbookConsensus, 
-  calculateExchangeConsensus, 
   calculateFairProbability,
-  calculateEdge,
   devigBookmakerMarket,
   trimmedMean,
   median
@@ -264,7 +261,7 @@ export function generateAlertCandidates(
   
   // Step 5: Evaluate best offers with leave-one-out
   for (const [offerKey, offer] of bestOffers) {
-    const [selection, type] = offerKey.split('_');
+    const [selection] = offerKey.split('_');
     const selectionData = marketData.selections[selection];
     const booksCount = selectionData.sportsbooks.length;
     const exchangesCount = selectionData.exchanges.length;

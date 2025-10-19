@@ -80,7 +80,7 @@ export interface Database {
           is_exchange: boolean;
           selection: string;
           decimal_odds: number;
-          raw: any;
+          raw: unknown;
           created_at: string;
         };
         Insert: {
@@ -92,7 +92,7 @@ export interface Database {
           is_exchange: boolean;
           selection: string;
           decimal_odds: number;
-          raw: any;
+          raw: unknown;
         };
         Update: {
           id?: string;
@@ -103,7 +103,7 @@ export interface Database {
           is_exchange?: boolean;
           selection?: string;
           decimal_odds?: number;
-          raw?: any;
+          raw?: unknown;
         };
       };
       candidates: {

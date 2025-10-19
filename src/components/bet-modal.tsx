@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { formatPercentage, formatCurrency } from '@/lib/utils';
+import { formatCurrency } from '@/lib/utils';
 
 interface Candidate {
   id: string;

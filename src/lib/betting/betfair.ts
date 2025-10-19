@@ -8,6 +8,50 @@ type JsonRpcRequest = {
   id: number;
 };
 
+type BetfairEventType = {
+  eventType: { id: string; name: string };
+  marketCount: number;
+};
+
+type BetfairRunner = {
+  selectionId: number;
+  runnerName: string;
+  handicap?: number;
+};
+
+type BetfairMarketCatalogue = {
+  marketId: string;
+  marketName: string;
+  runners?: BetfairRunner[];
+};
+
+type BetfairRunnerBook = {
+  selectionId: number;
+  status: string;
+  ex?: {
+    availableToBack?: Array<{ price: number; size: number }>;
+    availableToLay?: Array<{ price: number; size: number }>;
+  };
+};
+
+type BetfairMarketBook = {
+  marketId: string;
+  isMarketDataDelayed: boolean;
+  status: string;
+  runners?: BetfairRunnerBook[];
+};
+
+type BetfairPlaceInstruction = {
+  orderType: string;
+  selectionId: number;
+  side: string;
+  limitOrder: {
+    size: number;
+    price: number;
+    persistenceType: string;
+  };
+};
+
 async function betfairRpc<T>(appKey: string, sessionToken: string, method: string, params: Record<string, unknown>): Promise<T> {
   const payload: JsonRpcRequest[] = [{ jsonrpc: '2.0', method, params, id: 1 }];
   const res = await fetch('https://api.betfair.com/exchange/betting/json-rpc/v1', {
@@ -125,8 +169,8 @@ export async function placeBetOnBetfair(input: PlaceBetInput): Promise<PlaceBetR
     if (!sportName) {
       return { ok: false, reason: `Unsupported sport_key: ${input.sportKey}` };
     }
-    const eventTypes = await betfairRpc<any[]>(appKey, sessionToken, 'SportsAPING/v1.0/listEventTypes', { filter: {} });
-    const eventType = eventTypes.find((et: any) => et.eventType?.name === sportName);
+    const eventTypes = await betfairRpc<BetfairEventType[]>(appKey, sessionToken, 'SportsAPING/v1.0/listEventTypes', { filter: {} });
+    const eventType = eventTypes.find((et) => et.eventType?.name === sportName);
     if (!eventType) {
       return { ok: false, reason: `Betfair event type not found: ${sportName}` };
     }
@@ -143,7 +187,7 @@ export async function placeBetOnBetfair(input: PlaceBetInput): Promise<PlaceBetR
       textQuery: `${ev.home} ${ev.away}`,
     };
 
-    const catalogues = await betfairRpc<any[]>(appKey, sessionToken, 'SportsAPING/v1.0/listMarketCatalogue', {
+    const catalogues = await betfairRpc<BetfairMarketCatalogue[]>(appKey, sessionToken, 'SportsAPING/v1.0/listMarketCatalogue', {
       filter,
       maxResults: 50,
       marketProjection: ['RUNNER_DESCRIPTION'],
@@ -166,7 +210,7 @@ export async function placeBetOnBetfair(input: PlaceBetInput): Promise<PlaceBetR
 
     let chosen: { marketId: string; selectionId: number; runnerName: string } | null = null;
     for (const m of catalogues) {
-      const rn: any[] = m.runners || [];
+      const rn = m.runners || [];
       const hit = rn.find(r => r.runnerName === wantedRunnerName);
       if (hit) {
         chosen = { marketId: m.marketId, selectionId: hit.selectionId, runnerName: hit.runnerName };
@@ -178,12 +222,12 @@ export async function placeBetOnBetfair(input: PlaceBetInput): Promise<PlaceBetR
     }
 
     // Fetch live book and confirm edge still acceptable
-    const books = await betfairRpc<any[]>(appKey, sessionToken, 'SportsAPING/v1.0/listMarketBook', {
+    const books = await betfairRpc<BetfairMarketBook[]>(appKey, sessionToken, 'SportsAPING/v1.0/listMarketBook', {
       marketIds: [chosen.marketId],
       priceProjection: { priceData: ['EX_BEST_OFFERS'] },
     });
     const marketBook = books[0];
-    const rb = (marketBook?.runners || []).find((r: any) => r.selectionId === chosen!.selectionId);
+    const rb = (marketBook?.runners || []).find((r) => r.selectionId === chosen!.selectionId);
     const bestToBack = rb?.ex?.availableToBack?.[0] || null;
     if (!bestToBack || !bestToBack.price || !bestToBack.size) {
       return { ok: false, reason: 'No back offers available on Betfair' };
@@ -210,7 +254,7 @@ export async function placeBetOnBetfair(input: PlaceBetInput): Promise<PlaceBetR
       instructionReports?: Array<{
         status: string;
         errorCode?: string;
-        instruction?: any;
+        instruction?: BetfairPlaceInstruction;
         betId?: string;
         placedDate?: string;
         averagePriceMatched?: number;

@@ -8,7 +8,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { SummaryCard } from "@/components/ui/summary-card";
 import { Dropdown } from "@/components/ui/dropdown";
 import { EmptyState } from "@/components/ui/empty-state";
-import { cn, formatCurrency, formatDateTime, formatPercentage } from "@/lib/utils";
+import { cn, formatCurrency, formatDateTime } from "@/lib/utils";
 
 interface Bet {
   id: string;
