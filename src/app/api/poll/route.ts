@@ -33,6 +33,15 @@ export async function POST(_request: NextRequest) {
       }, { status: 500 });
     }
 
+    // Check if Odds API is configured
+    if (!oddsApiClient) {
+      console.error('❌ Poll: Odds API not configured');
+      return NextResponse.json({
+        success: false,
+        error: 'Odds API not configured - please add ODDS_API_KEY to your environment variables',
+      }, { status: 500 });
+    }
+
     // Get enabled sports
     const { data: enabledSports, error: sportsError } = await supabaseAdmin
       .from('sports')

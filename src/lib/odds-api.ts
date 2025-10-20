@@ -131,8 +131,10 @@ export class OddsApiClient {
   }
 }
 
-// Singleton instance
-export const oddsApiClient = new OddsApiClient(config.oddsApiKey);
+// Singleton instance - only create if API key is configured
+export const oddsApiClient = config.oddsApiKey && config.oddsApiKey.length > 0
+  ? new OddsApiClient(config.oddsApiKey)
+  : null;
 
 /**
  * Convert Odds API response to our internal format

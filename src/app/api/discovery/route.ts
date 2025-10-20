@@ -20,6 +20,24 @@ export async function POST(_request: NextRequest) {
       });
     }
 
+    // Check if Supabase is available
+    if (!supabaseAdmin) {
+      console.error('❌ Discovery: Supabase not configured');
+      return NextResponse.json({
+        success: false,
+        error: 'Database not configured - please add SUPABASE_SERVICE_ROLE_KEY to your environment variables',
+      }, { status: 500 });
+    }
+
+    // Check if Odds API is configured
+    if (!oddsApiClient) {
+      console.error('❌ Discovery: Odds API not configured');
+      return NextResponse.json({
+        success: false,
+        error: 'Odds API not configured - please add ODDS_API_KEY to your environment variables',
+      }, { status: 500 });
+    }
+
     // Get all sports from The Odds API
     console.log('🔍 Discovery: Fetching sports from The Odds API...');
     const sports = await oddsApiClient.getSports();
@@ -30,11 +48,12 @@ export async function POST(_request: NextRequest) {
     console.log(`✅ Discovery: ${targetSports.length} sports match our criteria`);
     
     let enabledCount = 0;
+    let failedCount = 0;
 
     // Store/update sports in database with enabled flag
     console.log(`🔍 Discovery: Upserting ${targetSports.length} sports to database...`);
     for (const sport of targetSports) {
-      const { error } = await supabaseAdmin!
+      const { error } = await supabaseAdmin
         .from('sports')
         .upsert({
           sport_key: sport.key,
@@ -45,18 +64,21 @@ export async function POST(_request: NextRequest) {
         });
 
       if (error) {
-        console.error(`❌ Error upserting sport ${sport.key}:`, error);
+        failedCount++;
+        console.error(`❌ Error upserting sport ${sport.key}:`, error.message, error.details);
       } else {
         enabledCount++;
         console.log(`✓ Enabled: ${sport.key} (${sport.title})`);
       }
     }
 
+    console.log(`✅ Discovery: ${enabledCount} enabled, ${failedCount} failed`);
+
     // Disable sports that no longer match our criteria
     const targetKeys = targetSports.map(s => s.key);
     if (targetKeys.length > 0) {
       console.log(`🔍 Discovery: Disabling sports that no longer match criteria...`);
-      const { error: disableError } = await supabaseAdmin!
+      const { error: disableError } = await supabaseAdmin
         .from('sports')
         .update({ enabled: false })
         .not('sport_key', 'in', `(${targetKeys.map(k => `'${k}'`).join(',')})`);
@@ -66,11 +88,20 @@ export async function POST(_request: NextRequest) {
       }
     }
 
+    // Return error if none succeeded
+    if (enabledCount === 0 && targetSports.length > 0) {
+      console.error(`❌ Discovery: Failed to enable any sports (${failedCount} errors)`);
+      return NextResponse.json({
+        success: false,
+        error: `Failed to enable any sports. Database errors occurred. Check logs for details.`,
+      }, { status: 500 });
+    }
+
     console.log(`✅ Discovery: Complete! ${enabledCount} sports enabled`);
 
     return NextResponse.json({
       success: true,
-      message: `Discovery completed: ${enabledCount} sports enabled. You can now run Poll to fetch odds.`,
+      message: `Discovery completed: ${enabledCount} of ${targetSports.length} sports enabled successfully. You can now run Poll to fetch odds.`,
       data: {
         sports: targetSports.map(s => ({ key: s.key, title: s.title })),
         sportsEnabled: enabledCount,
