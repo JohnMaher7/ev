@@ -77,6 +77,16 @@ npm install
 npm run dev
 ```
 
+## Alert Thresholds & Engine
+
+Alert generation thresholds are defined centrally in `src/lib/config.ts` under `alertThresholds`. The alert engine (`src/lib/alerts.ts`) consumes these values so that changes are global:
+
+- **Solid** alerts require edge ≥ `config.alertThresholds.solid`, positive EV, and sufficient market coverage.
+- **Scout** alerts require edge ≥ `config.alertThresholds.scout` and EV ≥ 0.
+- **Exchange Value** alerts compare sportsbook consensus vs. exchange consensus using `config.alertThresholds.exchangeValue`.
+
+To adjust thresholds, edit the values in `config.ts` and redeploy. The admin panel `/admin` and alerts UI automatically reflect the updated defaults.
+
 Visit `http://localhost:3000/alerts` to access the alerts view. The root route redirects there automatically.
 
 ## Core Screens

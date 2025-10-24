@@ -12,6 +12,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/ui/empty-state";
 import { cn, formatDateTime, formatPercentage } from "@/lib/utils";
+import { config } from "@/lib/config";
 import { BetModal } from "@/components/bet-modal";
 import type { Candidate } from "@/types/candidate";
 
@@ -47,7 +48,7 @@ function formatTier(tier: Candidate["alert_tier"]) {
 export default function AlertsView() {
   const queryClient = useQueryClient();
   const [filters, setFilters] = useState<FiltersState>({
-    minEdge: 0.008,
+    minEdge: config.alertThresholds.solid,
     tier: "",
     marketType: "",
   });
@@ -152,7 +153,7 @@ export default function AlertsView() {
   };
 
   const handleResetFilters = () => {
-    setFilters({ minEdge: 0.008, tier: "", marketType: "" });
+    setFilters({ minEdge: config.alertThresholds.solid, tier: "", marketType: "" });
   };
 
   const handleClearAlert = async (alertId: string) => {

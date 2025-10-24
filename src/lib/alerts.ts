@@ -121,6 +121,11 @@ export function generateAlertCandidates(
   sport_key: string
 ): AlertCandidate[] {
   const candidates: AlertCandidate[] = [];
+
+  const solidThreshold = config.alertThresholds.solid;
+  const scoutThreshold = config.alertThresholds.scout;
+  const exchangeThreshold = config.alertThresholds.exchangeValue;
+  const solidDisagreementThreshold = solidThreshold / 2;
   
   // Note: OddsAPI doesn't provide lay markets, so no need to skip them
   
@@ -340,17 +345,17 @@ export function generateAlertCandidates(
     // SOLID: (books ≥ 3) OR (books = 2 AND ≥1 stable exchange) and (EV ≥ 0 OR odds_edge ≥ 0.002) and bookDisagreement ≥ 0.0005
     const solidEligible = (booksCount >= 3) || (booksCount === 2 && hasStableExchanges);
     const passesEV = expectedValuePerPound >= 0;
-    const passesOddsEdge = oddsEdge >= 0.002;
-    const passesDisagreement = bookDisagreement >= 0.0005;
+    const passesOddsEdge = oddsEdge >= solidThreshold;
+    const passesDisagreement = bookDisagreement >= solidDisagreementThreshold;
     
-    const willCreateSolid = solidEligible && (passesEV || passesOddsEdge) && passesDisagreement;
+    const willCreateSolid = solidEligible && passesEV && passesOddsEdge && passesDisagreement;
     
     if (willCreateSolid) {
       alert_tier = 'SOLID';
       console.log(`  ✅ SOLID ALERT: ${offer.source} @ ${offer.price} (EV: ${expectedValuePerPound.toFixed(6)}, edge: ${(oddsEdge * 100).toFixed(3)}%)`);
     }
     // SCOUT: (books ≥ 2) and odds_edge ≥ 0.05 and EV ≥ 0
-    else if (booksCount >= 2 && oddsEdge >= 0.05 && expectedValuePerPound >= 0) {
+    else if (booksCount >= 2 && oddsEdge >= scoutThreshold && expectedValuePerPound >= 0) {
       alert_tier = 'SCOUT';
       console.log(`  ✅ SCOUT ALERT: ${offer.source} @ ${offer.price} (EV: ${expectedValuePerPound.toFixed(6)}, edge: ${(oddsEdge * 100).toFixed(3)}%)`);
     }
@@ -358,7 +363,7 @@ export function generateAlertCandidates(
     else if (booksCount >= 3 && hasStableExchanges && global?.sb && global?.ex && offer.isExchange) {
       const sbAdvantage = global.sb - global.ex;
       
-      if (sbAdvantage >= 0.03 && expectedValuePerPound >= 0) {
+      if (sbAdvantage >= exchangeThreshold && expectedValuePerPound >= 0) {
         alert_tier = 'EXCHANGE_VALUE';
         notes = `SB consensus advantage: ${(sbAdvantage * 100).toFixed(2)}pp`;
         console.log(`  ✅ EXCHANGE_VALUE ALERT: ${offer.source} @ ${offer.price} (advantage: ${(sbAdvantage * 100).toFixed(3)}%, EV: ${expectedValuePerPound.toFixed(6)})`);

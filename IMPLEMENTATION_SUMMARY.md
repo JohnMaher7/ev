@@ -134,6 +134,13 @@ The application is fully configurable through environment variables:
 - Bookmaker allowlists
 - Exchange commission rates
 
+### Alert Thresholds
+
+The alert engine reads thresholds from `src/lib/config.ts` (`alertThresholds`). Adjusting those values automatically updates:
+- Back-end alert generation (`src/lib/alerts.ts`)
+- Admin stats endpoint (`/api/admin/config`)
+- Alerts UI default filters (`AlertsView`)
+
 ## 📈 Performance Features
 
 - Real-time data updates with React Query caching

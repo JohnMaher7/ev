@@ -78,10 +78,11 @@ export async function POST(_request: NextRequest) {
     const targetKeys = targetSports.map(s => s.key);
     if (targetKeys.length > 0) {
       console.log(`🔍 Discovery: Disabling sports that no longer match criteria...`);
+      const exclusionList = `(${targetKeys.map(k => `"${k}"`).join(',')})`;
       const { error: disableError } = await supabaseAdmin
         .from('sports')
         .update({ enabled: false })
-        .not('sport_key', 'in', `(${targetKeys.map(k => `'${k}'`).join(',')})`);
+        .not('sport_key', 'in', exclusionList);
 
       if (disableError) {
         console.error('❌ Error disabling outdated sports:', disableError);
