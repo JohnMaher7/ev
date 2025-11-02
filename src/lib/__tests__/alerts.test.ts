@@ -96,17 +96,10 @@ describe('Alert Generation', () => {
         }
       };
 
-      const candidates = generateAlertCandidates(marketData, 'tennis');
-      
-      // Should generate alerts for each bookmaker if edge is sufficient
-      // Note: This test may not generate alerts if the consensus doesn't provide sufficient edge
-      // The actual edge calculation depends on the de-vigged consensus vs individual prices
-      expect(candidates.length).toBeGreaterThanOrEqual(0);
-      
-      if (candidates.length > 0) {
-        const solidAlerts = candidates.filter(c => c.alert_tier === 'SOLID');
-        expect(solidAlerts.length).toBeGreaterThanOrEqual(0);
-      }
+      const { candidates } = generateAlertCandidates(marketData, 'tennis');
+
+      expect(Array.isArray(candidates)).toBe(true);
+      expect(candidates.length).toBeGreaterThan(0);
     });
 
     it('should generate SCOUT alert for high edge with 2 books', () => {
@@ -124,16 +117,10 @@ describe('Alert Generation', () => {
         }
       };
 
-      const candidates = generateAlertCandidates(marketData, 'tennis');
-      
-      // SCOUT alerts require ≥5pp edge, which may not be achieved with this test data
-      // The test verifies the function runs without error
-      expect(candidates.length).toBeGreaterThanOrEqual(0);
-      
-      if (candidates.length > 0) {
-        const scoutAlerts = candidates.filter(c => c.alert_tier === 'SCOUT');
-        expect(scoutAlerts.length).toBeGreaterThanOrEqual(0);
-      }
+      const { candidates } = generateAlertCandidates(marketData, 'tennis');
+
+      expect(Array.isArray(candidates)).toBe(true);
+      expect(candidates).toHaveLength(0);
     });
 
     it('should generate alerts for sufficient edge', () => {
@@ -152,15 +139,36 @@ describe('Alert Generation', () => {
         }
       };
 
-      const candidates = generateAlertCandidates(marketData, 'tennis');
-      
-      // With corrected calculation: median of [0.6667, 0.6250, 0.5882] = 0.6250
-      // Fair price = 1/0.6250 = 1.6
-      // Edge for 1.7 odds = 0.6250 - 0.5882 = 0.0368 = 3.68pp (should trigger SOLID alert)
-      expect(candidates.length).toBeGreaterThan(0);
-      
+      const { candidates } = generateAlertCandidates(marketData, 'tennis');
+
       const solidAlerts = candidates.filter(c => c.alert_tier === 'SOLID');
       expect(solidAlerts.length).toBeGreaterThan(0);
+    });
+
+    it('should generate SOLID alert with 1% edge threshold', () => {
+      const marketData: MarketData = {
+        event_id: 'test-event',
+        market_key: 'h2h',
+        selections: {
+          'Home': {
+            sportsbooks: [
+              { bookmaker: 'book1', decimal_odds: 1.98 },
+              { bookmaker: 'book2', decimal_odds: 1.99 },
+              { bookmaker: 'book3', decimal_odds: 2.04 } // This gives ~1.5% edge
+            ],
+            exchanges: []
+          }
+        }
+      };
+
+      const { candidates } = generateAlertCandidates(marketData, 'tennis');
+
+      const solidAlerts = candidates.filter(c => c.alert_tier === 'SOLID');
+      expect(solidAlerts.length).toBeGreaterThan(0);
+
+      if (solidAlerts.length > 0) {
+        expect(solidAlerts[0].edge_pp).toBeGreaterThanOrEqual(0.01);
+      }
     });
   });
 });

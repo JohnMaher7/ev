@@ -30,7 +30,7 @@ The alert engine consumes these values:
 
 - **SOLID**: edge ≥ `solid`, EV ≥ 0, and bookmaker disagreement ≥ `solid / 2`. Requires either ≥3 sportsbooks or 2 plus a stable exchange.
 - **SCOUT**: edge ≥ `scout`, EV ≥ 0, and ≥2 sportsbooks. Used for early looks with less coverage.
-- **EXCHANGE_VALUE**: sportsbook consensus advantage over exchange ≥ `exchangeValue`, EV ≥ 0, and both sportsbook consensus and stable exchange available.
+- **EXCHANGE_VALUE**: sportsbook consensus probability exceeds an available exchange offer (after commission) by ≥ `exchangeValue` and EV ≥ 0. The exchange can be unstable; we rely on consensus to detect stale exchange prices.
 
 If you change the values in `config.ts`, redeploy; the backend and UI will both use the new thresholds automatically.
 

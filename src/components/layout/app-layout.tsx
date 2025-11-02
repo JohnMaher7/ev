@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { ReactNode } from "react";
 import { cn } from "@/lib/utils";
-import { Clock3, LineChart, ListChecks, PanelLeft, Rows4, Settings2 } from "lucide-react";
+import { Clock3, LineChart, ListChecks, PanelLeft, Rows4, Settings2, FileText, Goal } from "lucide-react";
 
 type NavItem = {
   href: string;
@@ -17,7 +17,9 @@ const NAV_ITEMS: NavItem[] = [
   { href: "/alerts", label: "Alerts", icon: <Rows4 className="h-4 w-4" /> },
   { href: "/bets", label: "Bets", icon: <ListChecks className="h-4 w-4" /> },
   { href: "/metrics", label: "Performance", icon: <LineChart className="h-4 w-4" /> },
+  { href: "/logs", label: "System Logs", icon: <FileText className="h-4 w-4" /> },
   { href: "/admin", label: "Operations", icon: <Settings2 className="h-4 w-4" /> },
+  { href: "/strategies/epl-under25", label: "EPL Under 2.5", icon: <Goal className="h-4 w-4" /> },
 ];
 
 interface AppLayoutProps {

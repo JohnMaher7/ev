@@ -6,13 +6,17 @@ import { groupSnapshotsIntoMarkets, generateAlertCandidates } from '@/lib/odds-e
 import { type AlertCandidate } from '@/lib/alerts';
 import { placeBetOnBetfair } from '@/lib/betting/betfair';
 import { v4 as uuidv4 } from 'uuid';
+import { Logger } from '@/lib/logger';
 
-export async function POST(_request: NextRequest) {
+export async function POST(request: NextRequest) {
+  const logger = new Logger('poll');
+  const startTime = performance.now();
+  
   try {
-    console.log('📊 Poll: Starting poll cycle...');
+    logger.section('POLL CYCLE STARTED');
 
     if (config.demoMode) {
-      console.log('⏭️ Poll: Demo mode enabled - skipping operations');
+      logger.info('Demo mode enabled - skipping operations');
       return NextResponse.json({
         success: true,
         message: 'Demo mode is enabled. Polling skipped.',
@@ -26,7 +30,7 @@ export async function POST(_request: NextRequest) {
 
     // Check if Supabase is available
     if (!supabaseAdmin) {
-      console.error('❌ Poll: Supabase not configured');
+      logger.error('Supabase not configured');
       return NextResponse.json({
         success: false,
         error: 'Supabase not configured - please add SUPABASE_SERVICE_ROLE_KEY to your environment variables',
@@ -35,7 +39,7 @@ export async function POST(_request: NextRequest) {
 
     // Check if Odds API is configured
     if (!oddsApiClient) {
-      console.error('❌ Poll: Odds API not configured');
+      logger.error('Odds API not configured');
       return NextResponse.json({
         success: false,
         error: 'Odds API not configured - please add ODDS_API_KEY to your environment variables',
@@ -49,12 +53,12 @@ export async function POST(_request: NextRequest) {
       .eq('enabled', true);
 
     if (sportsError) {
-      console.error('❌ Poll: Error fetching sports:', sportsError.message);
+      logger.error('Error fetching sports', { error: sportsError.message });
       throw new Error(`Error fetching enabled sports: ${sportsError.message}`);
     }
 
     if (!enabledSports || enabledSports.length === 0) {
-      console.log('ℹ️ Poll: No enabled sports found in database');
+      logger.info('No enabled sports found in database');
       return NextResponse.json({
         success: true,
         message: 'No enabled sports found. Run Discovery first to set up sports.',
@@ -66,22 +70,29 @@ export async function POST(_request: NextRequest) {
       });
     }
 
-    console.log(`📊 Poll: Processing ${enabledSports.length} enabled sports`);
+    logger.info(`Processing ${enabledSports.length} enabled sports`);
 
     const allEvents: OddsApiEvent[] = [];
     const allSnapshots: ReturnType<typeof convertOddsApiToSnapshots> = [];
     const allCandidates: AlertCandidate[] = [];
     let apiCallsSaved = 0;
     let eventsSkipped = 0;
+    const skipReasons = {
+      alreadyStarted: 0,
+      recentlyPolled: 0,
+    };
 
     // Poll each enabled sport with smart filtering
     for (const sport of enabledSports) {
       try {
-        console.log(`\n🔍 Fetching events for ${sport.sport_key}...`);
+        logger.section(`Sport: ${sport.sport_key}`, '🎯');
         
         // Use generic getOdds method with bookmaker allowlist for all sports
+        const fetchTimer = logger.time(`Fetching ${sport.sport_key}`);
         const events = await oddsApiClient.getOddsWithAllowlist(sport.sport_key);
-        console.log(`  ↳ API returned ${events.length} events`);
+        fetchTimer();
+        
+        logger.info(`API returned ${events.length} events`);
 
         if (events.length === 0) {
           continue;
@@ -90,7 +101,6 @@ export async function POST(_request: NextRequest) {
         // Smart filtering: Skip events that don't need polling
         const now = new Date();
         const minPollInterval = 30 * 60 * 1000; // 30 minutes
-        const maxAdvanceWindow = 7 * 24 * 60 * 60 * 1000; // 7 days
         
         const filteredEvents = [];
         
@@ -101,12 +111,7 @@ export async function POST(_request: NextRequest) {
           // Skip if event has already started
           if (timeUntilEvent < 0) {
             eventsSkipped++;
-            continue;
-          }
-          
-          // Skip if event is too far in the future (>7 days)
-          if (timeUntilEvent > maxAdvanceWindow) {
-            eventsSkipped++;
+            skipReasons.alreadyStarted++;
             continue;
           }
           
@@ -124,6 +129,7 @@ export async function POST(_request: NextRequest) {
             // Skip if polled within last 30 minutes
             if (timeSinceLastPoll < minPollInterval) {
               eventsSkipped++;
+              skipReasons.recentlyPolled++;
               apiCallsSaved++;
               continue;
             }
@@ -132,7 +138,12 @@ export async function POST(_request: NextRequest) {
           filteredEvents.push(event);
         }
         
-        console.log(`  ↳ ${filteredEvents.length} events need polling (${eventsSkipped} skipped)`);
+        logger.summary({
+          events_to_poll: filteredEvents.length,
+          events_skipped: eventsSkipped,
+          already_started: skipReasons.alreadyStarted,
+          recently_polled: skipReasons.recentlyPolled,
+        });
         
         if (filteredEvents.length === 0) {
           continue;
@@ -154,7 +165,7 @@ export async function POST(_request: NextRequest) {
             });
 
           if (eventError) {
-            console.error(`❌ Error upserting event ${event.event_id}:`, eventError);
+            logger.error(`Error upserting event ${event.event_id}`, { error: eventError });
           }
         }
 
@@ -169,22 +180,26 @@ export async function POST(_request: NextRequest) {
             .insert(snapshots);
 
           if (snapshotsError) {
-            console.error(`❌ Error inserting snapshots for ${sport.sport_key}:`, snapshotsError);
+            logger.error(`Error inserting snapshots for ${sport.sport_key}`, { error: snapshotsError });
           }
         }
 
-        // Process for alerts
+        // Process for alerts - collect all diagnostics
         const marketData = groupSnapshotsIntoMarkets(snapshots);
-        console.log(`  ↳ Processing ${marketData.length} markets`);
+        const allDiagnostics: ReturnType<typeof generateAlertCandidates>["diagnostics"] = [];
+        const sportCandidates: AlertCandidate[] = [];
         
         for (const market of marketData) {
-          const candidates = generateAlertCandidates(market, sport.sport_key);
+          // Process market silently without logging each market name
+          const result = generateAlertCandidates(market, sport.sport_key);
           
-          if (candidates.length > 0) {
-            console.log(`  ✅ Found ${candidates.length} alerts for ${market.market_key}`);
-            
+          // Collect diagnostics and candidates
+          allDiagnostics.push(...result.diagnostics);
+          sportCandidates.push(...result.candidates);
+          
+          if (result.candidates.length > 0) {
             // Add IDs to candidates
-            const candidatesWithIds = candidates.map(candidate => ({
+            const candidatesWithIds = result.candidates.map(candidate => ({
               ...candidate,
               id: uuidv4(),
             }));
@@ -197,11 +212,10 @@ export async function POST(_request: NextRequest) {
               .insert(candidatesWithIds);
 
             if (candidatesError) {
-              console.error(`❌ Error inserting candidates for ${sport.sport_key}:`, candidatesError);
+              logger.error(`Error inserting candidates for ${sport.sport_key}`, { error: candidatesError });
             }
 
-            // Auto-bet strategy: betfair_ex_uk with edge >= configured minEdge
-            // Primary: candidate already on betfair_ex_uk. Secondary: try latest betfair snapshot if not best.
+            // Auto-bet strategy
             const autoBetEnabled = config.autoBet.enabled;
             if (autoBetEnabled) {
               for (const c of candidatesWithIds) {
@@ -219,10 +233,10 @@ export async function POST(_request: NextRequest) {
                       .gte('created_at', oneHourAgo)
                       .limit(1);
                     if (betsErr) {
-                      console.warn('AutoBet dedupe check error:', betsErr.message);
+                      logger.warn('AutoBet dedupe check error', { error: betsErr.message });
                     }
                     if (existingBets && existingBets.length > 0) {
-                      console.log(`🤚 Skipping autobet (recent bet exists) for ${c.selection} @ ${odds}`);
+                      logger.debug(() => `Skipping autobet (recent bet exists) for ${c.selection} @ ${odds}`);
                       return;
                     }
 
@@ -246,14 +260,20 @@ export async function POST(_request: NextRequest) {
                       acceptedFairPrice: c.fair_price,
                     });
                     if (res.ok) {
-                      console.log(`🟢 AutoBet placed on ${c.selection} @ ${odds} stake=${stake} betId=${res.betId}`);
+                      logger.info(`AutoBet placed on ${c.selection}`, { 
+                        odds, 
+                        stake, 
+                        betId: res.betId 
+                      });
                     } else {
-                      console.warn(`🟡 AutoBet failed for ${c.selection}: ${res.reason}`);
+                      logger.warn(`AutoBet failed for ${c.selection}`, { 
+                        reason: res.reason 
+                      });
                     }
                   };
 
                   if (c.edge_pp >= config.autoBet.minEdge && c.best_source === config.autoBet.exchangeKey) {
-                    console.log(`🔎 AutoBet (candidate source=betfair): edge=${c.edge_pp.toFixed(6)} >= ${config.autoBet.minEdge}`);
+                    logger.debug(() => `AutoBet (candidate source=betfair): edge=${c.edge_pp.toFixed(6)} >= ${config.autoBet.minEdge}`);
                     await attemptPlace(c.offered_price);
                     continue;
                   }
@@ -275,7 +295,7 @@ export async function POST(_request: NextRequest) {
                       .order('taken_at', { ascending: false })
                       .limit(10);
                     if (snapsErr) {
-                      console.warn('AutoBet snapshots fetch error:', snapsErr.message);
+                      logger.warn('AutoBet snapshots fetch error', { error: snapsErr.message });
                     } else if (snaps && snaps.length > 0) {
                       const filtered = linePoint == null ? snaps : snaps.filter(s => s.point === linePoint);
                       const best = filtered.sort((a, b) => (b.decimal_odds as number) - (a.decimal_odds as number))[0];
@@ -283,19 +303,22 @@ export async function POST(_request: NextRequest) {
                         const betfairOdds = best.decimal_odds as number;
                         const implied = 1 / betfairOdds;
                         const edge = c.fair_prob - implied;
-                        console.log(`🔎 AutoBet (snap betfair): price=${betfairOdds} edge=${edge.toFixed(6)} threshold=${config.autoBet.minEdge}`);
+                        logger.debug(() => `AutoBet (snap betfair): price=${betfairOdds} edge=${edge.toFixed(6)} threshold=${config.autoBet.minEdge}`);
                         if (edge >= config.autoBet.minEdge) {
                           await attemptPlace(betfairOdds);
                         } else {
-                          console.log('⏭️ Skipping autobet (betfair edge below threshold)');
+                          logger.debug(() => 'Skipping autobet (betfair edge below threshold)');
                         }
                       } else {
-                        console.log('⏭️ Skipping autobet (no recent betfair odds found)');
+                        logger.debug(() => 'Skipping autobet (no recent betfair odds found)');
                       }
                     }
                   }
-                } catch (e) {
-                  console.error('AutoBet error:', e);
+                } catch (error) {
+                  logger.error('AutoBet error', {
+                    error,
+                    requestId: request.headers.get('x-request-id') ?? undefined,
+                  });
                 }
               }
             }
@@ -303,16 +326,50 @@ export async function POST(_request: NextRequest) {
         }
 
       } catch (error) {
-        console.error(`❌ Error polling ${sport.sport_key}:`, error);
+        logger.error(`Error polling ${sport.sport_key}`, { error });
       }
     }
+    
+    // Generate ONE consolidated summary at the end of polling
+    if (allCandidates.length > 0 || allEvents.length > 0) {
+      logger.section('ALERT SUMMARY', '🎯');
+      
+      const summaryLines: string[] = [];
+      summaryLines.push(`Total Candidates Evaluated: ${allCandidates.length + eventsSkipped}`);
+      summaryLines.push(`Alerts Generated: ${allCandidates.length}`);
+      
+      // Count near misses from all diagnostics (would need to track this)
+      summaryLines.push(`Markets Processed: ${allEvents.length}`);
+      
+      // Show alerts that triggered
+      if (allCandidates.length > 0) {
+        summaryLines.push('');
+        summaryLines.push('🎯 Alerts Triggered:');
+        allCandidates.forEach(c => {
+          const emoji = c.alert_tier === 'SOLID' ? '🟢' : c.alert_tier === 'SCOUT' ? '🟡' : '🔵';
+          summaryLines.push(`  ${emoji} ${c.alert_tier}: ${c.selection} @ ${c.best_source} (${c.offered_price}x) - Edge: ${(c.edge_pp * 100).toFixed(2)}%`);
+        });
+      } else {
+        summaryLines.push('');
+        summaryLines.push('No alerts triggered this cycle');
+        summaryLines.push('💡 Markets are currently efficient - waiting for better opportunities');
+      }
+      
+      logger.info('\n' + summaryLines.join('\n'));
+    }
 
-    console.log(`\n📊 Poll Summary:`);
-    console.log(`  • Events processed: ${allEvents.length}`);
-    console.log(`  • Events skipped: ${eventsSkipped}`);
-    console.log(`  • Snapshots stored: ${allSnapshots.length}`);
-    console.log(`  • Alerts generated: ${allCandidates.length}`);
-    console.log(`  • API calls saved: ~${apiCallsSaved} (smart filtering)`);
+    const duration = ((performance.now() - startTime) / 1000).toFixed(2);
+    
+    logger.section('POLL SUMMARY', '📊');
+    logger.summary({
+      duration_seconds: duration,
+      events_processed: allEvents.length,
+      events_skipped: eventsSkipped,
+      skip_reasons: `${skipReasons.alreadyStarted} started, ${skipReasons.recentlyPolled} recent`,
+      snapshots_stored: allSnapshots.length,
+      alerts_generated: allCandidates.length,
+      api_calls_saved: apiCallsSaved,
+    });
 
     const message = allEvents.length > 0 
       ? `Poll completed: ${allEvents.length} events, ${allSnapshots.length} snapshots, ${allCandidates.length} alerts generated`
@@ -331,7 +388,7 @@ export async function POST(_request: NextRequest) {
     });
 
   } catch (error) {
-    console.error('Polling error:', error);
+    logger.error('Polling error', { error });
     return NextResponse.json(
       { 
         success: false, 

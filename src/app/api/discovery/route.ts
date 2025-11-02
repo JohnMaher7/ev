@@ -1,10 +1,10 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextResponse } from 'next/server';
 import { oddsApiClient } from '@/lib/odds-api';
 import { supabaseAdmin } from '@/lib/supabase';
 import { config } from '@/lib/config';
 import { shouldEnableSport } from '@/lib/utils';
 
-export async function POST(_request: NextRequest) {
+export async function POST() {
   try {
     console.log('🔍 Discovery: Starting sports discovery...');
 

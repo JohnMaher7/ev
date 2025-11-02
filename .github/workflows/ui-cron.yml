@@ -1,0 +1,22 @@
+name: UI Scheduler
+on:
+  schedule:
+    - cron: '55 7 * * *'     # discovery daily 07:55 UTC
+    - cron: '0 8-22 * * *'   # poll hourly 08:00–22:00 UTC
+  workflow_dispatch:
+
+jobs:
+  call-endpoints:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Discovery
+        if: startsWith(github.event.schedule, '55 7')
+        run: curl -X POST -sS -f "$UI_BASE_URL/api/discovery"
+        env:
+          UI_BASE_URL: ${{ secrets.UI_BASE_URL }}
+
+      - name: Poll
+        if: startsWith(github.event.schedule, '0 ')
+        run: curl -X POST -sS -f "$UI_BASE_URL/api/poll"
+        env:
+          UI_BASE_URL: ${{ secrets.UI_BASE_URL }}

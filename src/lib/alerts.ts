@@ -13,6 +13,8 @@ import {
   trimmedMean,
   median
 } from './consensus';
+import { Logger } from './logger';
+import { diagnoseAlertMiss, type AlertDiagnostic } from './alert-diagnostics';
 
 export interface AlertCandidate {
   id?: string; // Optional for generation, required for database
@@ -115,12 +117,15 @@ export function calculateExchangeEdgeAndEV(
 
 /**
  * Generate alert candidates for a market
+ * Returns both candidates and diagnostics for aggregation
  */
 export function generateAlertCandidates(
   marketData: MarketData,
   sport_key: string
-): AlertCandidate[] {
+): { candidates: AlertCandidate[]; diagnostics: AlertDiagnostic[] } {
+  const logger = new Logger('alerts');
   const candidates: AlertCandidate[] = [];
+  const diagnostics: AlertDiagnostic[] = [];
 
   const solidThreshold = config.alertThresholds.solid;
   const scoutThreshold = config.alertThresholds.scout;
@@ -230,7 +235,7 @@ export function generateAlertCandidates(
     
     globalConsensus.set(selection, { sb: sbConsensus, ex: exConsensus, fair: fairGlobal });
     
-    console.log(`  📊 Selection ${selection}: Global SB=${sbConsensus}, EX=${exConsensus}, Fair=${fairGlobal}`);
+    logger.debug(() => `Selection ${selection}: Global SB=${sbConsensus}, EX=${exConsensus}, Fair=${fairGlobal}`);
   }
   
   // Step 4: Choose best offers only
@@ -305,7 +310,7 @@ export function generateAlertCandidates(
     }
     
     if (!decisionFair) {
-      console.log(`  ❌ No decision fair for ${offer.source} @ ${selection}, skipping`);
+      logger.debug(() => `No decision fair for ${offer.source} @ ${selection}, skipping`);
       continue;
     }
     
@@ -319,24 +324,36 @@ export function generateAlertCandidates(
     // Get bookmaker true probability
     let bookmakerTrueProbability: number | null = null;
     if (offer.isExchange) {
-      bookmakerTrueProbability = exchangeProbsByOutcome.get(selection)?.get(offer.source) || null;
+      const stableExchangeProb = exchangeProbsByOutcome.get(selection)?.get(offer.source) || null;
+      if (stableExchangeProb !== null) {
+        bookmakerTrueProbability = stableExchangeProb;
+      } else {
+        const effectiveExchangePrice = applyExchangeCommission(
+          offer.price,
+          config.exchangeCommissionDefault
+        );
+        bookmakerTrueProbability = decimalToProbability(effectiveExchangePrice);
+      }
     } else {
-      bookmakerTrueProbability = bookmakerProbsByOutcome.get(selection)?.get(offer.source) || null;
+      bookmakerTrueProbability = bookmakerProbsByOutcome
+        .get(selection)?.get(offer.source) || null;
     }
     
     if (!bookmakerTrueProbability) {
-      console.log(`  ❌ No bookmaker true prob for ${offer.source} @ ${selection}, skipping`);
+      logger.debug(() => `No bookmaker true prob for ${offer.source} @ ${selection}, skipping`);
       continue;
     }
     
     // Optional tiny guard
     const bookDisagreement = decisionFair - bookmakerTrueProbability;
     
-    // Debug print per offer
-    console.log(`  💰 offer=${offer.source}@${offer.price}`);
-    console.log(`  📊 fair(LOO)=${decisionFair.toFixed(6)}  fair(global)=${global?.fair?.toFixed(6) || 'null'}`);
-    console.log(`  📊 1/odds=${impliedChanceFromOfferedOdds.toFixed(6)}  bookTrue=${bookmakerTrueProbability.toFixed(6)}`);
-    console.log(`  📊 oddsEdge=${(oddsEdge * 100).toFixed(3)}%  EV=${expectedValuePerPound.toFixed(6)}  bookDisagree=${(bookDisagreement * 100).toFixed(3)}%`);
+    // Debug logging with lazy evaluation
+    logger.debug(() => [
+      `offer=${offer.source}@${offer.price}`,
+      `fair(LOO)=${decisionFair.toFixed(6)}  fair(global)=${global?.fair?.toFixed(6) || 'null'}`,
+      `1/odds=${impliedChanceFromOfferedOdds.toFixed(6)}  bookTrue=${bookmakerTrueProbability.toFixed(6)}`,
+      `oddsEdge=${(oddsEdge * 100).toFixed(3)}%  EV=${expectedValuePerPound.toFixed(6)}  bookDisagree=${(bookDisagreement * 100).toFixed(3)}%`
+    ].join('\n  '));
     
     // Step 7: When to fire an alert
     let alert_tier: 'SOLID' | 'SCOUT' | 'EXCHANGE_VALUE' | null = null;
@@ -352,29 +369,54 @@ export function generateAlertCandidates(
     
     if (willCreateSolid) {
       alert_tier = 'SOLID';
-      console.log(`  ✅ SOLID ALERT: ${offer.source} @ ${offer.price} (EV: ${expectedValuePerPound.toFixed(6)}, edge: ${(oddsEdge * 100).toFixed(3)}%)`);
     }
-    // SCOUT: (books ≥ 2) and odds_edge ≥ 0.05 and EV ≥ 0
+    // SCOUT: (books ≥ 2) and odds_edge ≥ 0.03 and EV ≥ 0
     else if (booksCount >= 2 && oddsEdge >= scoutThreshold && expectedValuePerPound >= 0) {
       alert_tier = 'SCOUT';
-      console.log(`  ✅ SCOUT ALERT: ${offer.source} @ ${offer.price} (EV: ${expectedValuePerPound.toFixed(6)}, edge: ${(oddsEdge * 100).toFixed(3)}%)`);
     }
     // EXCHANGE_VALUE: (books ≥ 3 AND ≥1 stable exchange) and SB advantage ≥ 0.03 and EV ≥ 0
-    else if (booksCount >= 3 && hasStableExchanges && global?.sb && global?.ex && offer.isExchange) {
-      const sbAdvantage = global.sb - global.ex;
-      
-      if (sbAdvantage >= exchangeThreshold && expectedValuePerPound >= 0) {
+    else if (offer.isExchange && booksCount >= 3 && global?.sb) {
+      const exchangePriceAfterCommission = applyExchangeCommission(
+        offer.price,
+        config.exchangeCommissionDefault
+      );
+      const exchangeProbFromOffer = decimalToProbability(exchangePriceAfterCommission);
+      const sbConsensusAdvantage = global.sb - exchangeProbFromOffer;
+
+      if (sbConsensusAdvantage >= exchangeThreshold && expectedValuePerPound >= 0) {
         alert_tier = 'EXCHANGE_VALUE';
-        notes = `SB consensus advantage: ${(sbAdvantage * 100).toFixed(2)}pp`;
-        console.log(`  ✅ EXCHANGE_VALUE ALERT: ${offer.source} @ ${offer.price} (advantage: ${(sbAdvantage * 100).toFixed(3)}%, EV: ${expectedValuePerPound.toFixed(6)})`);
+        notes = `SB consensus advantage vs exchange: ${(sbConsensusAdvantage * 100).toFixed(2)}pp`;
       }
     }
     
-    const willCreateCandidate = alert_tier !== null;
-    console.log(`  📊 solidEligible=${solidEligible}  willCreate=${willCreateCandidate}`);
+    // Diagnostics for non-alerts
+    if (!alert_tier) {
+      const diagnostic = diagnoseAlertMiss(
+        selection,
+        offer.source,
+        offer.price,
+        decisionFair,
+        bookmakerTrueProbability,
+        booksCount,
+        hasStableExchanges,
+        solidEligible && oddsEdge >= 0 ? 'SOLID' : 'SCOUT'
+      );
+      diagnostics.push(diagnostic);
+      
+      // Log near misses
+      if (diagnostic.nearMiss) {
+        logger.nearMiss(
+          selection,
+          oddsEdge,
+          solidEligible ? solidThreshold : scoutThreshold,
+          diagnostic.thresholdMissReason
+        );
+      }
+    }
     
     if (alert_tier) {
-      candidates.push({
+      // Log the alert
+      const candidate: AlertCandidate = {
         event_id: marketData.event_id,
         sport_key,
         market_key: marketData.market_key,
@@ -389,9 +431,13 @@ export function generateAlertCandidates(
         books_count: booksCount,
         exchanges_count: exchangesCount,
         notes,
-      });
+      };
+      
+      logger.alert(alert_tier, candidate);
+      candidates.push(candidate);
     }
   }
   
-  return candidates;
+  // Return both candidates and diagnostics for aggregation
+  return { candidates, diagnostics };
 }

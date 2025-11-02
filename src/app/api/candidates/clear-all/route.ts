@@ -1,8 +1,8 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
 import { config } from '@/lib/config';
 
-export async function DELETE(_request: NextRequest) {
+export async function DELETE() {
   try {
     // If in demo mode or no Supabase connection, return success
     if (config.demoMode || !supabaseAdmin) {

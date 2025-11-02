@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
 
 function toIsoStartOfDay(date = new Date()): string {
@@ -7,7 +7,7 @@ function toIsoStartOfDay(date = new Date()): string {
   return d.toISOString();
 }
 
-export async function GET(_request: NextRequest) {
+export async function GET() {
   try {
     if (!supabaseAdmin) {
       return NextResponse.json({ success: true, data: {

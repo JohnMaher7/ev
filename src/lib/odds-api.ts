@@ -105,16 +105,20 @@ export class OddsApiClient {
   }
 
   /**
-   * Get odds for any sport with bookmaker allowlist applied
+   * Get odds for any sport with ALL available bookmakers
    * Use this generic method instead of sport-specific wrappers
+   * 
+   * Professional Strategy: Request all available bookmakers to maximize consensus accuracy.
+   * We only bet on exchanges, but use all books for fair value calculation.
+   * API cost is per-request, not per-bookmaker, so no penalty for getting all data.
    * 
    * @param sport - Sport key from The Odds API (e.g., 'tennis_atp_us_open', 'soccer_efl_champ', 'darts_pdc_world_champs')
    * @param regions - Region code, defaults to 'uk'
    * @param markets - Market types, defaults to 'h2h,totals'
    */
   async getOddsWithAllowlist(sport: string, regions: string = 'uk', markets: string = 'h2h,totals'): Promise<OddsApiEvent[]> {
-    const bookmakers = config.bookmakerAllowlist.join(',');
-    return this.getOdds(sport, regions, markets, 'decimal', 'iso', bookmakers);
+    // Don't pass bookmakers parameter - get ALL available bookmakers for maximum consensus data
+    return this.getOdds(sport, regions, markets, 'decimal', 'iso');
   }
 
   /**
@@ -168,7 +172,9 @@ export function convertOddsApiToSnapshots(events: OddsApiEvent[]): Array<{
     if (!event.bookmakers) continue;
 
     for (const bookmaker of event.bookmakers) {
-      const isExchange = ['betfair', 'smarkets', 'matchbook'].includes(bookmaker.key);
+      // Identify exchanges vs sportsbooks
+      // Exchanges have commission-based models and better liquidity
+      const isExchange = ['betfair', 'betfair_ex_uk', 'smarkets', 'matchbook'].includes(bookmaker.key);
 
       for (const market of bookmaker.markets) {
         for (const outcome of market.outcomes) {

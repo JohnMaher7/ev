@@ -4,206 +4,44 @@
   - Schedules keepAlive every 15 minutes using node-cron
   - On keepAlive failure, immediately re-logins and replaces the in-memory token
   - Reads secrets from environment variables
-
-  Required environment variables:
-    BETFAIR_APP_KEY
-    BETFAIR_USERNAME
-    BETFAIR_PASSWORD
-    (one of) BETFAIR_PFX_PATH or BETFAIR_PFX_BASE64
-    BETFAIR_PFX_PASSWORD
-
-  Optional environment variables:
-    KEEPALIVE_CRON (default: every 15 minutes)
 */
 
 const path = require('path');
-const dotenv = require('dotenv');
-// Load .env first, then .env.local (overrides)
-dotenv.config({ path: path.resolve(process.cwd(), '.env') });
-dotenv.config({ path: path.resolve(process.cwd(), '.env.local') });
 const fs = require('fs');
-const https = require('https');
-const http = require('http');
-const { createClient } = require('@supabase/supabase-js');
-const { URL } = require('url');
-const cron = require('node-cron');
+const dotenv = require('dotenv');
 
-function readPfxBuffer() {
-  const base64 = process.env.BETFAIR_PFX_BASE64;
-  const filePath = process.env.BETFAIR_PFX_PATH;
+const envPaths = [
+  path.resolve(process.cwd(), '.env'),
+  path.resolve(process.cwd(), '.env.local'),
+];
 
-  if (base64 && base64.trim().length > 0) {
-    try {
-      return Buffer.from(base64, 'base64');
-    } catch (e) {
-      console.error('Failed to decode BETFAIR_PFX_BASE64');
-      throw e;
+for (const envPath of envPaths) {
+  if (fs.existsSync(envPath)) {
+    const result = dotenv.config({ path: envPath, override: true });
+    if (result.error) {
+      console.warn(`[bot] Failed to load ${envPath}:`, result.error.message);
     }
   }
-  if (filePath && fs.existsSync(filePath)) {
-    return fs.readFileSync(filePath);
-  }
-  throw new Error('Missing PFX input. Provide BETFAIR_PFX_BASE64 or BETFAIR_PFX_PATH');
 }
+const http = require('http');
+const { createClient } = require('@supabase/supabase-js');
+const cron = require('node-cron');
+const crypto = require('node:crypto');
 
-function postFormWithClientCert(targetUrl, formObj, pfxBuffer, passphrase, extraHeaders = {}) {
-  return new Promise((resolve, reject) => {
-    const urlObj = new URL(targetUrl);
-    const formBody = Object.entries(formObj)
-      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
-      .join('&');
+const {
+  initializeSessionManager,
+  ensureLogin,
+  keepAlive,
+  getSessionToken,
+  setSessionToken,
+  betfairRpc,
+  getLoginDiagnostics,
+} = require('./lib/betfair-session');
+const { roundToBetfairTick, findBestMatch } = require('./lib/betfair-utils');
+const { createEplUnder25Strategy } = require('./lib/strategies/epl-under25');
 
-    const options = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + (urlObj.search || ''),
-      port: urlObj.port || 443,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Content-Length': Buffer.byteLength(formBody),
-        ...extraHeaders,
-      },
-      pfx: pfxBuffer,
-      passphrase,
-    };
+initializeSessionManager({ logger: console });
 
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => (data += chunk));
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          resolve({ statusCode: res.statusCode, body: json });
-        } catch (e) {
-          resolve({ statusCode: res.statusCode, body: data });
-        }
-      });
-    });
-    req.on('error', (err) => reject(err));
-    req.write(formBody);
-    req.end();
-  });
-}
-
-function postJson(targetUrl, headers = {}) {
-  return new Promise((resolve, reject) => {
-    const urlObj = new URL(targetUrl);
-    const options = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + (urlObj.search || ''),
-      port: urlObj.port || 443,
-      method: 'POST',
-      headers,
-    };
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => (data += chunk));
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          resolve({ statusCode: res.statusCode, body: json });
-        } catch (e) {
-          resolve({ statusCode: res.statusCode, body: data });
-        }
-      });
-    });
-    req.on('error', (err) => reject(err));
-    req.end();
-  });
-}
-
-function requireEnvs(required) {
-  const missing = required.filter((k) => !process.env[k] || String(process.env[k]).trim() === '');
-  if (missing.length > 0) {
-    throw new Error(`Missing required envs: ${missing.join(', ')}`);
-  }
-}
-
-function resolveSsoEndpoints() {
-  const j = (process.env.BETFAIR_JURISDICTION || 'GLOBAL').toUpperCase();
-  switch (j) {
-    case 'AUS':
-    case 'AU':
-    case 'ANZ':
-      return {
-        certLogin: 'https://identitysso-cert.betfair.com.au/api/certlogin',
-        keepAlive: 'https://identitysso.betfair.com.au/api/keepAlive',
-      };
-    case 'IT':
-      return {
-        certLogin: 'https://identitysso-cert.betfair.it/api/certlogin',
-        keepAlive: 'https://identitysso.betfair.it/api/keepAlive',
-      };
-    case 'ES':
-      return {
-        certLogin: 'https://identitysso-cert.betfair.es/api/certlogin',
-        keepAlive: 'https://identitysso.betfair.es/api/keepAlive',
-      };
-    case 'RO':
-      return {
-        certLogin: 'https://identitysso-cert.betfair.ro/api/certlogin',
-        keepAlive: 'https://identitysso.betfair.ro/api/keepAlive',
-      };
-    default:
-      return {
-        certLogin: 'https://identitysso-cert.betfair.com/api/certlogin',
-        keepAlive: 'https://identitysso.betfair.com/api/keepAlive',
-      };
-  }
-}
-
-async function certLogin() {
-  const appKey = process.env.BETFAIR_APP_KEY;
-  const username = process.env.BETFAIR_USERNAME;
-  const password = process.env.BETFAIR_PASSWORD;
-  const pfxPass = process.env.BETFAIR_PFX_PASSWORD;
-
-  requireEnvs(['BETFAIR_APP_KEY', 'BETFAIR_USERNAME', 'BETFAIR_PASSWORD', 'BETFAIR_PFX_PASSWORD']);
-
-  const pfx = readPfxBuffer();
-  const headers = {
-    'X-Application': appKey,
-  };
-
-  const { certLogin } = resolveSsoEndpoints();
-  const { statusCode, body } = await postFormWithClientCert(
-    certLogin,
-    { username, password },
-    pfx,
-    pfxPass,
-    headers
-  );
-
-  if (statusCode !== 200) {
-    const reason = typeof body === 'object' ? JSON.stringify(body) : String(body);
-    throw new Error(`certLogin failed HTTP ${statusCode}: ${reason}`);
-  }
-  if (!body || !body.sessionToken || body.loginStatus !== 'SUCCESS') {
-    throw new Error(`certLogin unexpected response: ${JSON.stringify(body)}`);
-  }
-  return body.sessionToken;
-}
-
-async function keepAlive(sessionToken) {
-  const appKey = process.env.BETFAIR_APP_KEY;
-  if (!appKey || !sessionToken) {
-    throw new Error('keepAlive missing appKey or sessionToken');
-  }
-  const { keepAlive } = resolveSsoEndpoints();
-  const { statusCode, body } = await postJson(keepAlive, {
-    'X-Application': appKey,
-    'X-Authentication': sessionToken,
-  });
-  if (statusCode !== 200) {
-    const reason = typeof body === 'object' ? JSON.stringify(body) : String(body);
-    throw new Error(`keepAlive failed HTTP ${statusCode}: ${reason}`);
-  }
-  if (typeof body === 'object' && body.token) {
-    // Betfair keepAlive returns the same token in "token"
-    return { ok: true, token: body.token };
-  }
-  return { ok: true, token: sessionToken };
-}
 
 // --- Betfair JSON-RPC helpers ---
 function mapMarketKeyToTypeCode(marketKey) {
@@ -225,50 +63,14 @@ function resolveSportKeyToEventTypeName(sportKey) {
   return null;
 }
 
-function roundToBetfairTick(price) {
-  const bands = [
-    { max: 2.0, step: 0.01 },
-    { max: 3.0, step: 0.02 },
-    { max: 4.0, step: 0.05 },
-    { max: 6.0, step: 0.1 },
-    { max: 10.0, step: 0.2 },
-    { max: 20.0, step: 0.5 },
-    { max: 30.0, step: 1.0 },
-    { max: 50.0, step: 2.0 },
-    { max: 100.0, step: 5.0 },
-    { max: 1000.0, step: 10.0 },
-  ];
-  const p = Math.max(1.01, Math.min(price, 1000));
-  const band = bands.find(b => p <= b.max) || bands[bands.length - 1];
-  const ticks = Math.floor((p - 1.0) / band.step);
-  const rounded = 1.0 + ticks * band.step;
-  return Math.max(1.01, Math.min(rounded, 1000));
-}
-
-async function betfairRpc(sessionToken, method, params) {
-  const appKey = process.env.BETFAIR_APP_KEY;
-  if (!appKey || !sessionToken) throw new Error('betfairRpc missing credentials');
-  const payload = [{ jsonrpc: '2.0', method, params, id: 1 }];
-  const res = await fetch('https://api.betfair.com/exchange/betting/json-rpc/v1', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Application': appKey,
-      'X-Authentication': sessionToken,
-    },
-    body: JSON.stringify(payload),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(`Betfair RPC HTTP ${res.status}: ${JSON.stringify(data)}`);
-  if (!Array.isArray(data) || !data[0]) throw new Error('Betfair RPC unexpected response');
-  if (data[0].error) throw new Error(`Betfair RPC method error: ${JSON.stringify(data[0].error)}`);
-  return data[0].result;
+async function betfairRpcWithToken(sessionToken, method, params) {
+  return betfairRpc(sessionToken, method, params);
 }
 
 async function locateMarketAndRunner(sessionToken, ev, marketKey, selection) {
   const sportName = resolveSportKeyToEventTypeName(ev.sport_key);
   if (!sportName) throw new Error(`Unsupported sport_key: ${ev.sport_key}`);
-  const eventTypes = await betfairRpc(sessionToken, 'SportsAPING/v1.0/listEventTypes', { filter: {} });
+  const eventTypes = await betfairRpcWithToken(sessionToken, 'SportsAPING/v1.0/listEventTypes', { filter: {} });
   const eventType = (eventTypes || []).find(et => et.eventType && et.eventType.name === sportName);
   if (!eventType) throw new Error(`Betfair event type not found: ${sportName}`);
   const eventTypeId = eventType.eventType.id;
@@ -280,13 +82,21 @@ async function locateMarketAndRunner(sessionToken, ev, marketKey, selection) {
     eventTypeIds: [eventTypeId],
     marketTypeCodes: [typeCode],
     marketStartTime: { from: start, to: end },
-    textQuery: `${ev.home} ${ev.away}`,
   };
-  const catalogues = await betfairRpc(sessionToken, 'SportsAPING/v1.0/listMarketCatalogue', {
+  const catalogues = await betfairRpcWithToken(sessionToken, 'SportsAPING/v1.0/listMarketCatalogue', {
     filter,
-    maxResults: 50,
-    marketProjection: ['RUNNER_DESCRIPTION'],
+    maxResults: 200,
+    marketProjection: ['RUNNER_DESCRIPTION', 'EVENT'],
   });
+
+  const oddsEventName = `${ev.home} vs ${ev.away}`;
+  const uniqueEvents = [...new Map((catalogues || []).map(c => [c.event?.name, c.event])).values()];
+  const matchedEventName = findBestMatch(oddsEventName, uniqueEvents.map(e => e?.name || ''), { logger: console });
+  if (!matchedEventName) {
+    throw new Error(`Fuzzy match failed for event: ${oddsEventName}`);
+  }
+
+  const candidates = (catalogues || []).filter(c => c.event?.name === matchedEventName);
 
   const wantedRunnerName = (() => {
     if (typeCode === 'MATCH_ODDS') {
@@ -301,81 +111,40 @@ async function locateMarketAndRunner(sessionToken, ev, marketKey, selection) {
     return selection;
   })();
 
-  for (const m of catalogues || []) {
-    const rn = m.runners || [];
-    const hit = rn.find(r => r.runnerName === wantedRunnerName);
+  for (const market of candidates) {
+    const runnerNames = (market.runners || []).map(r => r.runnerName);
+    const matchedRunner = findBestMatch(wantedRunnerName, runnerNames, { logger: console });
+    if (!matchedRunner) continue;
+    const hit = market.runners.find(r => r.runnerName === matchedRunner);
     if (hit) {
-      return { marketId: m.marketId, selectionId: hit.selectionId, runnerName: hit.runnerName };
+      return { marketId: market.marketId, selectionId: hit.selectionId, runnerName: hit.runnerName };
     }
   }
-  throw new Error('No matching market/runner found on Betfair');
+
+  throw new Error(`No matching market/runner found on Betfair for event ${matchedEventName}`);
 }
 
 // --- Login orchestration with backoff/ban handling ---
-let sessionToken = null;
-const loginState = {
-  lastError: null,
-  blockedUntil: 0, // epoch ms
-  retryDelayMs: 60_000, // start at 60s
-};
-
-function ms(humanMs) {
-  return humanMs;
-}
-
-function formatDelay(msValue) {
-  const s = Math.ceil(msValue / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.ceil(s / 60);
-  return `${m}m`;
-}
-
-async function ensureLogin(trigger = 'manual') {
-  const now = Date.now();
-  if (sessionToken) return;
-  if (now < loginState.blockedUntil) {
-    const waitMs = loginState.blockedUntil - now;
-    console.warn(`[bot] Login blocked until ${new Date(loginState.blockedUntil).toISOString()} (waiting ${formatDelay(waitMs)})`);
-    return;
-  }
-
-  try {
-    console.log(`[bot] Attempting certLogin (trigger=${trigger})...`);
-    const token = await certLogin();
-    sessionToken = token;
-    process.env.BETFAIR_SESSION_TOKEN = sessionToken;
-    loginState.lastError = null;
-    loginState.retryDelayMs = 60_000; // reset backoff
-    console.log('[bot] certLogin SUCCESS');
-  } catch (e) {
-    const msg = e && e.message ? e.message : String(e);
-    loginState.lastError = msg;
-    // Handle temporary ban (rate limit) explicitly
-    if (/TEMPORARY_BAN_TOO_MANY_REQUESTS/i.test(msg)) {
-      // Betfair bans are typically short; wait 15 minutes before retrying
-      loginState.blockedUntil = Date.now() + ms(15 * 60 * 1000);
-      console.warn('[bot] TEMPORARY_BAN_TOO_MANY_REQUESTS → pausing logins for 15 minutes');
-    } else {
-      // Generic backoff (exponential up to 10 minutes)
-      const next = Math.min(loginState.retryDelayMs * 2, 10 * 60 * 1000);
-      console.warn(`[bot] certLogin failed: ${msg}. Retrying in ${formatDelay(loginState.retryDelayMs)} (max 10m)`);
-      const delay = loginState.retryDelayMs;
-      loginState.retryDelayMs = next;
-      setTimeout(() => {
-        ensureLogin('backoff');
-      }, delay);
-    }
-  }
-}
-
 async function main() {
   console.log('[bot] Starting Betfair bot...');
   // Kick off login (non-fatal if it fails; backoff handles retries)
   ensureLogin('startup');
 
-  // --- Supabase connection & candidate subscriber ---
+  async function requireSession(trigger) {
+    let token = getSessionToken();
+    if (token) return token;
+    await ensureLogin(trigger);
+    token = getSessionToken();
+    if (!token) {
+      throw new Error('Betfair session unavailable after ensureLogin');
+    }
+    return token;
+  }
+
+  // --- Supabase connection & candidate loop ---
   const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
   const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  let eplStrategy = null;
   if (!supabaseUrl || !supabaseKey) {
     console.warn('[bot] Supabase envs missing (SUPABASE_URL & SUPABASE_SERVICE_ROLE_KEY). Subscriber will not start.');
   } else {
@@ -384,9 +153,31 @@ async function main() {
       realtime: { params: { eventsPerSecond: 5 } },
     });
 
-    async function handleCandidateChange(payload) {
+    const strategyDeps = {
+      supabase,
+      betfair: {
+        requireSession,
+        rpc: betfairRpcWithToken,
+      },
+      logger: console,
+    };
+
+    if (process.env.ENABLE_EPL_UNDER25_STRATEGY === 'true') {
+      eplStrategy = createEplUnder25Strategy(strategyDeps);
+      eplStrategy.start().catch((err) => {
+        console.error('[strategy:epl_under25] failed to start:', err && err.message ? err.message : err);
+      });
+    } else {
+      console.log('[strategy:epl_under25] disabled (ENABLE_EPL_UNDER25_STRATEGY != true)');
+    }
+
+    const seenCandidateIds = [];
+    const seenCandidateSet = new Set();
+    let lastSeenCreatedAt = null;
+
+    async function handleCandidateChange(candidate) {
       try {
-        const c = payload.new || payload.record || payload;
+        const c = candidate;
         if (!c) return;
         console.log(`[bot] Candidate received: ${c.id} ${c.selection} @ ${c.offered_price}`);
 
@@ -429,19 +220,13 @@ async function main() {
         }
 
         // Ensure logged in
-        if (!sessionToken) {
-          await ensureLogin('candidate');
-          if (!sessionToken) {
-            console.log('[bot] No session after ensureLogin, skipping candidate');
-            return;
-          }
-        }
+        const sessionToken = await requireSession('candidate');
 
         // Locate market and runner
         const loc = await locateMarketAndRunner(sessionToken, ev, c.market_key, c.selection);
 
         // Fetch live best back
-        const books = await betfairRpc(sessionToken, 'SportsAPING/v1.0/listMarketBook', {
+        const books = await betfairRpcWithToken(sessionToken, 'SportsAPING/v1.0/listMarketBook', {
           marketIds: [loc.marketId],
           priceProjection: { priceData: ['EX_BEST_OFFERS'] },
         });
@@ -506,7 +291,7 @@ async function main() {
         const executionPrice = roundToBetfairTick(livePrice);
 
         // Place order
-        const placeRes = await betfairRpc(sessionToken, 'SportsAPING/v1.0/placeOrders', {
+        const placeRes = await betfairRpcWithToken(sessionToken, 'SportsAPING/v1.0/placeOrders', {
           marketId: loc.marketId,
           instructions: [
             {
@@ -520,7 +305,7 @@ async function main() {
               },
             },
           ],
-          customerRef: `ev-${c.event_id}-${Date.now()}`,
+          customerRef: c.id.substring(0, 32),
         });
 
         const ir = placeRes.instructionReports && placeRes.instructionReports[0];
@@ -558,12 +343,56 @@ async function main() {
       }
     }
 
-    supabase
-      .channel('candidates-inserts')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'candidates' }, handleCandidateChange)
-      .subscribe((status) => {
-        console.log('[bot] Supabase channel status:', status);
-      });
+    async function pollPendingCandidates() {
+      try {
+        console.log('[bot] Polling for new candidates...');
+        let query = supabase
+          .from('candidates')
+          .select('*')
+          .eq('best_source', 'betfair_ex_uk')
+          .order('created_at', { ascending: true })
+          .limit(50);
+
+        if (lastSeenCreatedAt) {
+          query = query.gt('created_at', lastSeenCreatedAt);
+        }
+
+        const { data, error } = await query;
+        if (error) {
+          console.error('[bot] Error polling Supabase:', error.message);
+          return;
+        }
+
+        console.log(`[bot] Poll found ${data ? data.length : 0} new candidates.`);
+
+        for (const candidate of data || []) {
+          if (seenCandidateSet.has(candidate.id)) {
+            continue;
+          }
+
+          await handleCandidateChange(candidate);
+
+          seenCandidateSet.add(candidate.id);
+          seenCandidateIds.push(candidate.id);
+
+          if (!lastSeenCreatedAt || candidate.created_at > lastSeenCreatedAt) {
+            lastSeenCreatedAt = candidate.created_at;
+          }
+
+          if (seenCandidateIds.length > 500) {
+            const oldest = seenCandidateIds.shift();
+            if (oldest) seenCandidateSet.delete(oldest);
+          }
+        }
+      } catch (pollErr) {
+        console.error('[bot] Poll loop failed:', pollErr.message || pollErr);
+      }
+    }
+
+    const pollIntervalMs = parseInt(process.env.SUPABASE_POLL_INTERVAL_MS || '5000', 10);
+    console.log(`[bot] Supabase polling loop started (interval ${pollIntervalMs} ms)`);
+    pollPendingCandidates();
+    setInterval(pollPendingCandidates, pollIntervalMs);
   }
 
   const scheduleExpr = process.env.KEEPALIVE_CRON || '*/15 * * * *';
@@ -571,9 +400,10 @@ async function main() {
 
   cron.schedule(scheduleExpr, async () => {
     try {
+      let sessionToken = getSessionToken();
       if (!sessionToken) {
         console.log('[bot] keepAlive: no session token yet; attempting login');
-        await ensureLogin('keepalive-missing-token');
+        sessionToken = await requireSession('keepalive-missing-token');
         return;
       }
       const res = await keepAlive(sessionToken);
@@ -581,13 +411,12 @@ async function main() {
         throw new Error('keepAlive returned not ok');
       }
       if (res.token && res.token !== sessionToken) {
-        sessionToken = res.token;
-        process.env.BETFAIR_SESSION_TOKEN = sessionToken;
+        setSessionToken(res.token);
       }
       console.log('[bot] keepAlive ok');
     } catch (e) {
       console.warn('[bot] keepAlive failed; attempting re-login:', e.message || e);
-      sessionToken = null;
+      setSessionToken(null);
       await ensureLogin('keepalive-fail');
     }
   });
@@ -613,14 +442,15 @@ async function main() {
   const server = http.createServer(async (req, res) => {
     if (req.url === '/' || req.url === '/health') {
       const net = await getPublicInfo();
+      const diag = getLoginDiagnostics();
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ok: true,
         service: 'betfair-bot',
         keepAliveCron: scheduleExpr,
-        hasSessionToken: Boolean(sessionToken && sessionToken.length > 0),
-        loginBlockedUntil: loginState.blockedUntil ? new Date(loginState.blockedUntil).toISOString() : null,
-        lastLoginError: loginState.lastError || null,
+        hasSessionToken: Boolean(getSessionToken()),
+        loginBlockedUntil: diag.blockedUntil ? new Date(diag.blockedUntil).toISOString() : null,
+        lastLoginError: diag.lastError || null,
         publicIp: net.ip || null,
         publicGeo: net.geo || {},
         platformRegion: process.env.FLY_REGION || process.env.RAILWAY_REGION || null,
@@ -645,21 +475,34 @@ async function main() {
     console.log(`[bot] Health server listening on :${port}`);
   });
 
-  process.on('SIGINT', () => {
-    console.log('\n[bot] Caught SIGINT, exiting.');
-    try { server.close(); } catch {}
+  const handleShutdown = (signal) => {
+    console.log(`\n[bot] Caught ${signal}, exiting.`);
+    try {
+      if (eplStrategy) {
+        eplStrategy.stop().catch((err) => {
+          console.warn('[strategy:epl_under25] stop error:', err && err.message ? err.message : err);
+        });
+      }
+      server.close();
+    } catch {}
     process.exit(0);
-  });
-  process.on('SIGTERM', () => {
-    console.log('\n[bot] Caught SIGTERM, exiting.');
-    try { server.close(); } catch {}
-    process.exit(0);
-  });
+  };
+
+  process.on('SIGINT', () => handleShutdown('SIGINT'));
+  process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 }
 
-main().catch((e) => {
+async function start() {
+  await main();
+}
+
+start().catch((e) => {
   console.error('[bot] Fatal error:', e);
   process.exit(1);
 });
+
+module.exports = {
+  start,
+};
 
 
