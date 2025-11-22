@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS events (
     home TEXT NOT NULL,
     away TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'upcoming',
+    last_polled_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -120,6 +121,8 @@ CREATE TABLE IF NOT EXISTS strategy_trades (
     betfair_market_id TEXT,
     selection_id BIGINT,
     runner_name TEXT,
+    competition_name TEXT,
+    event_name TEXT,
     kickoff_at TIMESTAMP WITH TIME ZONE,
     status TEXT NOT NULL DEFAULT 'scheduled' CHECK (status IN (
         'scheduled',
@@ -132,7 +135,9 @@ CREATE TABLE IF NOT EXISTS strategy_trades (
     )),
     back_order_ref TEXT,
     back_price DECIMAL(10,4),
+    back_price_snapshot DECIMAL(10,4),
     back_size DECIMAL(10,2),
+    back_stake DECIMAL(10,2) NOT NULL DEFAULT 0,
     back_matched_size DECIMAL(10,2) DEFAULT 0,
     lay_order_ref TEXT,
     lay_price DECIMAL(10,4),
@@ -140,10 +145,14 @@ CREATE TABLE IF NOT EXISTS strategy_trades (
     lay_matched_size DECIMAL(10,2) DEFAULT 0,
     hedge_target_price DECIMAL(10,4),
     target_stake DECIMAL(10,2),
+    total_stake DECIMAL(10,2) NOT NULL DEFAULT 0,
     pnl DECIMAL(10,2),
+    realised_pnl DECIMAL(10,2),
     margin DECIMAL(10,6),
     commission_paid DECIMAL(10,2),
+    settled_at TIMESTAMP WITH TIME ZONE,
     last_error TEXT,
+    state_data JSONB DEFAULT '{}'::jsonb,
     metadata JSONB
 );
 
@@ -162,6 +171,7 @@ CREATE TABLE IF NOT EXISTS strategy_settings (
     enabled BOOLEAN NOT NULL DEFAULT false,
     default_stake DECIMAL(10,2) NOT NULL DEFAULT 10,
     min_back_price DECIMAL(10,4) NOT NULL DEFAULT 2.0,
+    min_profit_pct NUMERIC DEFAULT 10,
     lay_target_price DECIMAL(10,4) NOT NULL DEFAULT 1.9,
     back_lead_minutes INTEGER NOT NULL DEFAULT 30,
     fixture_lookahead_days INTEGER NOT NULL DEFAULT 7,
@@ -255,4 +265,20 @@ $$ language 'plpgsql';
 -- Triggers for updating timestamps
 CREATE TRIGGER update_sports_updated_at BEFORE UPDATE ON sports FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE TRIGGER update_events_updated_at BEFORE UPDATE ON events FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Indexes for polling optimization
+CREATE INDEX IF NOT EXISTS idx_events_last_polled_at ON events(last_polled_at);
+CREATE INDEX IF NOT EXISTS idx_events_polling_filter ON events(status, commence_time, last_polled_at);
+
+-- Column comments
+COMMENT ON COLUMN events.last_polled_at IS 'Timestamp of last successful odds poll for this event. Used to implement smart polling that skips recently-polled events.';
+COMMENT ON COLUMN strategy_trades.state_data IS 'JSONB field for state machine logic storage (e.g., prices, timestamps, thresholds)';
+COMMENT ON COLUMN strategy_settings.min_profit_pct IS 'Minimum profit percentage to lock in (e.g. 10 for 10%)';
+COMMENT ON COLUMN strategy_trades.competition_name IS 'Competition label snapshot for reporting (e.g., English Premier League)';
+COMMENT ON COLUMN strategy_trades.event_name IS 'Human-readable event/fixture name snapshot, e.g., Home v Away';
+COMMENT ON COLUMN strategy_trades.back_price_snapshot IS 'Original back price (odds) captured at placement time for reporting';
+COMMENT ON COLUMN strategy_trades.back_stake IS 'Original back stake exposure (currency) placed on the market';
+COMMENT ON COLUMN strategy_trades.total_stake IS 'Aggregate stake/exposure across all legs for the trade (back + hedges)';
+COMMENT ON COLUMN strategy_trades.realised_pnl IS 'Final realised profit/loss after hedging and commission';
+COMMENT ON COLUMN strategy_trades.settled_at IS 'Timestamp when the trade outcome was finalised (hedged/settled)';
 

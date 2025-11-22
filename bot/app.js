@@ -389,7 +389,7 @@ async function main() {
       }
     }
 
-    const pollIntervalMs = parseInt(process.env.SUPABASE_POLL_INTERVAL_MS || '5000', 10);
+    const pollIntervalMs = parseInt(process.env.SUPABASE_POLL_INTERVAL_MS || '600000', 10);
     console.log(`[bot] Supabase polling loop started (interval ${pollIntervalMs} ms)`);
     pollPendingCandidates();
     setInterval(pollPendingCandidates, pollIntervalMs);

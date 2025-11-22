@@ -87,10 +87,10 @@ Check Vercel logs for:
 
 ## Need More Info?
 
-- **Full Guide:** `IMPLEMENTATION_COMPLETE.md`
-- **Technical Details:** `POLLING_OPTIMIZATION_GUIDE.md`
-- **What Changed:** `CHANGES_SUMMARY.md`
-- **Before/After:** `ARCHITECTURE_COMPARISON.md`
+- **Executive Summary:** `docs/architecture/EXECUTIVE_SUMMARY.md`
+- **Technical Details:** `docs/architecture/POLLING_OPTIMIZATION_GUIDE.md`
+- **Before/After:** `docs/architecture/ARCHITECTURE_COMPARISON.md`
+- **Adding Competitions:** `docs/guides/ADD_COMPETITIONS_GUIDE.md`
 
 ---
 
@@ -155,6 +155,9 @@ BOOKMAKER_ALLOWLIST=betfair,bet365,williamhill,skybet
 **Questions?** Check the full documentation files listed above.
 
 **Ready to deploy?** Follow the 3 steps at the top! 🚀
+
+
+
 
 
 

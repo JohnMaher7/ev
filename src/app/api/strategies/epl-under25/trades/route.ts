@@ -28,6 +28,16 @@ function demoTrades() {
       created_at: new Date(now).toISOString(),
       updated_at: new Date(now).toISOString(),
       last_error: null,
+      home: 'Man City',
+      away: 'Arsenal',
+      competition: 'English Premier League',
+      competition_name: 'English Premier League',
+      event_name: 'Man City v Arsenal',
+      back_price_snapshot: null,
+      back_stake: null,
+      total_stake: null,
+      realised_pnl: null,
+      settled_at: null,
     },
     {
       id: 'demo-trade-2',
@@ -49,6 +59,16 @@ function demoTrades() {
       created_at: new Date(now - 3 * 60 * 60 * 1000).toISOString(),
       updated_at: new Date(now - 2 * 60 * 60 * 1000).toISOString(),
       last_error: null,
+      home: 'Liverpool',
+      away: 'Chelsea',
+      competition: 'English Premier League',
+      competition_name: 'English Premier League',
+      event_name: 'Liverpool v Chelsea',
+      back_price_snapshot: 2.08,
+      back_stake: 10,
+      total_stake: 21,
+      realised_pnl: 2.1,
+      settled_at: new Date(now - 2 * 60 * 60 * 1000).toISOString(),
     },
   ];
 }
@@ -83,9 +103,46 @@ export async function GET(request: NextRequest) {
 
     if (error) throw new Error(error.message);
 
+    // Enrich with fixture details
+    let enrichedData = data;
+    if (data && data.length > 0) {
+      const eventIds = data.map((t) => t.betfair_event_id).filter(Boolean);
+      const uniqueEventIds = Array.from(new Set(eventIds));
+
+      if (uniqueEventIds.length > 0) {
+        const { data: fixtures, error: fixtureError } = await supabaseAdmin
+          .from('strategy_fixtures')
+          .select('betfair_event_id, home, away, competition')
+          .eq('strategy_key', STRATEGY_KEY)
+          .in('betfair_event_id', uniqueEventIds);
+
+        if (!fixtureError && fixtures) {
+          const fixtureMap = new Map();
+          fixtures.forEach((f) => fixtureMap.set(f.betfair_event_id, f));
+
+          enrichedData = data.map((trade) => {
+            const fixture = fixtureMap.get(trade.betfair_event_id);
+            const competitionName = trade.competition_name || fixture?.competition || 'English Premier League';
+            const eventName =
+              trade.event_name ||
+              (fixture?.home && fixture?.away ? `${fixture.home} v ${fixture.away}` : null);
+
+            return {
+              ...trade,
+              home: fixture?.home || null,
+              away: fixture?.away || null,
+              competition: competitionName,
+              competition_name: competitionName,
+              event_name: eventName,
+            };
+          });
+        }
+      }
+    }
+
     const nextCursor = data && data.length === limit ? data[data.length - 1]?.kickoff_at ?? null : null;
 
-    return NextResponse.json({ success: true, data, cursor: nextCursor });
+    return NextResponse.json({ success: true, data: enrichedData, cursor: nextCursor });
   } catch (error) {
     console.error('[api][epl-under25][trades][GET]', error);
     return NextResponse.json(
@@ -130,4 +187,3 @@ export async function POST(request: NextRequest) {
     );
   }
 }
-
