@@ -249,15 +249,18 @@ export function getStoredLogs(
     }
 
     if (filter.module) {
-      logs = logs.filter(log => log.module.includes(filter.module));
+      const moduleFilter = filter.module;
+      logs = logs.filter(log => log.module.includes(moduleFilter));
     }
 
     if (filter.startTime) {
-      logs = logs.filter(log => log.timestamp >= filter.startTime);
+      const startTimeFilter = filter.startTime;
+      logs = logs.filter(log => log.timestamp >= startTimeFilter);
     }
 
     if (filter.endTime) {
-      logs = logs.filter(log => log.timestamp <= filter.endTime);
+      const endTimeFilter = filter.endTime;
+      logs = logs.filter(log => log.timestamp <= endTimeFilter);
     }
 
     if (filter.search) {

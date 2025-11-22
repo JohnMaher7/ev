@@ -133,7 +133,7 @@ export default function EplUnder25View() {
             isLoading={tradesQuery.isLoading}
             error={error instanceof Error ? error.message : null}
             onCancel={(ids) => cancelTradesMutation.mutate(ids)}
-            cancelling={cancelTradesMutation.isLoading}
+            cancelling={cancelTradesMutation.isPending}
           />
         </CardContent>
       </Card>
