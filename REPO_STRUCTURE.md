@@ -51,7 +51,7 @@ Located in `bot/lib/`:
 Located in `bot/scripts/`:
 - **check-schema.js** - Database schema verification utility
 
-----
+---
 
 ## 🌐 Web Application (Next.js)
 
