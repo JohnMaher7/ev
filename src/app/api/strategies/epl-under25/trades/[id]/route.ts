@@ -4,14 +4,14 @@ import { supabaseAdmin } from '@/lib/supabase';
 import { config } from '@/lib/config';
 
 export async function GET(
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     if (config.demoMode || !supabaseAdmin) {
       return NextResponse.json({ success: true, data: [] });
     }
 
-    const { id } = params;
+    const { id } = await params;
     const { data, error } = await supabaseAdmin
       .from('strategy_trade_events')
       .select('*')
