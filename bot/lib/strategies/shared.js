@@ -1,0 +1,374 @@
+/**
+ * Shared utilities for EPL Under 2.5 strategies
+ * Extracted for reuse across pre-match and goal-reactive strategies
+ */
+
+const { addDays } = require('date-fns');
+const { roundToBetfairTick } = require('../betfair-utils');
+
+// --- Constants ---
+const SOCCER_EVENT_TYPE_ID = '1';
+const UNDER_RUNNER_NAME = 'Under 2.5 Goals';
+
+// Match multiple leagues: EPL, Bundesliga, La Liga, Serie A
+const COMPETITION_MATCHERS = [
+  /^English Premier League$/i,  // EPL
+  /^German Bundesliga$/i,        // Bundesliga
+  /^Spanish La Liga$/i,          // La Liga
+  /^Italian Serie A$/i,          // Serie A
+  /^UEFA Champions League$/i,    // Champions League
+];
+
+// Competition IDs from Betfair
+const COMPETITION_IDS = [
+  '10932509',  // English Premier League
+  '59',        // German Bundesliga
+  '117',       // Spanish La Liga
+  '81',        // Italian Serie A
+  '228',       // UEFA Champions League
+];
+
+// --- Stake/Price Calculations ---
+
+/**
+ * Calculate lay stake for balanced hedge
+ */
+function calculateLayStake({ backStake, backPrice, layPrice, commission = 0.02 }) {
+  if (!backStake || !backPrice || !layPrice) {
+    return { layStake: 0, profitBack: 0, profitLay: 0 };
+  }
+  
+  const rawStake = (backStake * backPrice) / layPrice;
+  const layStake = Math.max(0, Math.round(rawStake * 100) / 100);
+  
+  const profitBackBeforeComm = backStake * (backPrice - 1) - layStake * (layPrice - 1);
+  const profitLayBeforeComm = layStake - backStake;
+  
+  const profitBack = Number((profitBackBeforeComm * (1 - commission)).toFixed(2));
+  const profitLay = Number((profitLayBeforeComm * (1 - commission)).toFixed(2));
+  
+  return { layStake, profitBack, profitLay };
+}
+
+/**
+ * Calculate hedge stake from market book
+ */
+function calculateHedgeStake(book, selectionId, backStake, backPrice, commission = 0.02, overrideLayPrice = null) {
+  const runner = book?.runners?.find(r => r.selectionId == selectionId);
+  if (!runner) return { layStake: 0, layPrice: 0 };
+
+  const marketLayPrice = runner.ex?.availableToLay?.[0]?.price;
+  const effectiveLayPrice = overrideLayPrice || marketLayPrice;
+
+  if (!effectiveLayPrice) return { layStake: 0, layPrice: 0 };
+
+  const result = calculateLayStake({
+    backStake,
+    backPrice,
+    layPrice: effectiveLayPrice,
+    commission
+  });
+
+  return { ...result, layPrice: effectiveLayPrice };
+}
+
+/**
+ * Compute target lay price based on profit percentage
+ */
+function computeTargetLayPrice(backPrice, settings) {
+  const profitPct = settings?.min_profit_pct || 10;
+  const target = backPrice / (1 + (profitPct / 100));
+  return roundToBetfairTick(target);
+}
+
+/**
+ * Calculate realised P&L snapshot
+ */
+function computeRealisedPnlSnapshot({ backStake, backPrice, layStake, layPrice, commission = 0.02 }) {
+  if (!backStake || !backPrice) {
+    return null;
+  }
+  
+  if (!layStake || !layPrice) {
+    const profitBeforeComm = backStake * (backPrice - 1);
+    const profit = profitBeforeComm * (1 - commission);
+    return Number(profit.toFixed(2));
+  }
+  
+  const profitBackBeforeComm = backStake * (backPrice - 1) - layStake * (layPrice - 1);
+  const profitBack = profitBackBeforeComm * (1 - commission);
+  
+  const profitLayBeforeComm = layStake - backStake;
+  const profitLay = profitLayBeforeComm * (1 - commission);
+  
+  const realised = Math.min(profitBack, profitLay);
+  return Number(realised.toFixed(2));
+}
+
+// --- Naming Helpers ---
+
+function formatFixtureName(home, away, fallback = null) {
+  if (home && away) {
+    return `${home} v ${away}`;
+  }
+  return fallback || null;
+}
+
+// --- Betfair Tick Helpers ---
+
+/**
+ * Get N ticks below a price
+ */
+function ticksBelow(price, ticks = 1) {
+  const bands = [
+    { max: 2.0, step: 0.01 },
+    { max: 3.0, step: 0.02 },
+    { max: 4.0, step: 0.05 },
+    { max: 6.0, step: 0.1 },
+    { max: 10.0, step: 0.2 },
+    { max: 20.0, step: 0.5 },
+    { max: 30.0, step: 1.0 },
+    { max: 50.0, step: 2.0 },
+    { max: 100.0, step: 5.0 },
+    { max: 1000.0, step: 10.0 },
+  ];
+  
+  let current = price;
+  for (let i = 0; i < ticks; i++) {
+    const band = bands.find((b) => current <= b.max) || bands[bands.length - 1];
+    current = current - band.step;
+  }
+  return roundToBetfairTick(Math.max(1.01, current));
+}
+
+/**
+ * Get N ticks above a price
+ */
+function ticksAbove(price, ticks = 1) {
+  const bands = [
+    { max: 2.0, step: 0.01 },
+    { max: 3.0, step: 0.02 },
+    { max: 4.0, step: 0.05 },
+    { max: 6.0, step: 0.1 },
+    { max: 10.0, step: 0.2 },
+    { max: 20.0, step: 0.5 },
+    { max: 30.0, step: 1.0 },
+    { max: 50.0, step: 2.0 },
+    { max: 100.0, step: 5.0 },
+    { max: 1000.0, step: 10.0 },
+  ];
+  
+  let current = price;
+  for (let i = 0; i < ticks; i++) {
+    const band = bands.find((b) => current <= b.max) || bands[bands.length - 1];
+    current = current + band.step;
+  }
+  return roundToBetfairTick(Math.min(1000, current));
+}
+
+/**
+ * Check if two prices are within N ticks of each other
+ */
+function isWithinTicks(price1, price2, maxTicks = 1) {
+  // Calculate how many ticks apart the prices are
+  let tickCount = 0;
+  let current = Math.min(price1, price2);
+  const target = Math.max(price1, price2);
+  
+  while (current < target && tickCount <= maxTicks + 1) {
+    current = ticksAbove(current, 1);
+    tickCount++;
+  }
+  
+  return tickCount <= maxTicks;
+}
+
+/**
+ * Get middle price between back and lay (for tight spreads)
+ */
+function getMiddlePrice(backPrice, layPrice) {
+  // If lay is only 1 tick above back, use lay price
+  const oneTickAbove = ticksAbove(backPrice, 1);
+  if (Math.abs(layPrice - oneTickAbove) < 0.001) {
+    return layPrice;
+  }
+  
+  // Otherwise calculate middle and round to valid tick
+  const middle = (backPrice + layPrice) / 2;
+  return roundToBetfairTick(middle);
+}
+
+// --- Safe API Wrappers ---
+
+/**
+ * Create safe API wrapper functions for a strategy instance
+ */
+function createSafeApiWrappers(betfair, logger) {
+  async function requireSessionWithRetry(label) {
+    try {
+      return await betfair.requireSession(label);
+    } catch (err) {
+      logger.warn(`[shared] Session retry needed for ${label}: ${err.message}`);
+      return await betfair.requireSession(label);
+    }
+  }
+
+  async function rpcWithRetry(sessionToken, method, params, label) {
+    try {
+      return await betfair.rpc(sessionToken, method, params);
+    } catch (err) {
+      logger.warn(`[shared] RPC retry needed for ${label} (${method}): ${err.message}`);
+      try {
+        return await betfair.rpc(sessionToken, method, params);
+      } catch (err2) {
+        logger.error(`[shared] Emergency Exit: ${label} ${err2.message}`);
+        throw err2;
+      }
+    }
+  }
+
+  async function getMarketBookSafe(marketId, sessionToken, label) {
+    try {
+      const books = await rpcWithRetry(sessionToken, 'SportsAPING/v1.0/listMarketBook', {
+        marketIds: [marketId],
+        priceProjection: { priceData: ['EX_BEST_OFFERS'] },
+      }, label);
+      return books?.[0];
+    } catch {
+      return null;
+    }
+  }
+
+  async function getOrderStatusSafe(betId, sessionToken, label) {
+    if (!betId) return null;
+    try {
+      const res = await rpcWithRetry(sessionToken, 'SportsAPING/v1.0/listCurrentOrders', {
+        betIds: [betId],
+        orderProjection: 'ALL',
+      }, label);
+      return res?.currentOrders?.[0]?.status;
+    } catch {
+      return null;
+    }
+  }
+
+  async function cancelOrderSafe(betId, sessionToken, label) {
+    if (!betId) return;
+    try {
+      await rpcWithRetry(sessionToken, 'SportsAPING/v1.0/cancelOrders', {
+        instructions: [{ betId }],
+      }, label);
+    } catch {
+      // Logged in rpcWithRetry
+    }
+  }
+
+  async function placeLimitOrderSafe(marketId, selectionId, side, size, price, sessionToken, label, persistenceType = 'LAPSE') {
+    const customerRef = `${side}-${Date.now()}`;
+    try {
+      const placeRes = await rpcWithRetry(sessionToken, 'SportsAPING/v1.0/placeOrders', {
+        marketId,
+        customerRef,
+        instructions: [
+          {
+            selectionId,
+            side,
+            orderType: 'LIMIT',
+            limitOrder: {
+              size,
+              price,
+              persistenceType,
+            },
+          },
+        ],
+      }, label);
+      const report = placeRes?.instructionReports?.[0];
+      if (report && report.status === 'SUCCESS') {
+        return { status: 'SUCCESS', betId: report.betId };
+      }
+      return { status: 'FAILED', errorCode: report?.errorCode || placeRes?.errorCode };
+    } catch {
+      return { status: 'FAILED', errorCode: 'EXCEPTION' };
+    }
+  }
+
+  return {
+    requireSessionWithRetry,
+    rpcWithRetry,
+    getMarketBookSafe,
+    getOrderStatusSafe,
+    cancelOrderSafe,
+    placeLimitOrderSafe,
+  };
+}
+
+// --- Market/Runner Resolution ---
+
+async function ensureMarket(supabase, betfair, trade, sessionToken, strategyKey, logger) {
+  if (trade.betfair_market_id && trade.selection_id) {
+    return { marketId: trade.betfair_market_id, selectionId: trade.selection_id };
+  }
+
+  const { rpcWithRetry } = createSafeApiWrappers(betfair, logger);
+  
+  const markets = await rpcWithRetry(sessionToken, 'SportsAPING/v1.0/listMarketCatalogue', {
+    filter: {
+      eventIds: [trade.betfair_event_id],
+      marketTypeCodes: ['OVER_UNDER_25'],
+    },
+    maxResults: 1,
+    marketProjection: ['RUNNER_METADATA'],
+  }, 'ensureMarket');
+
+  const market = markets?.[0];
+  if (!market) {
+    logger.warn(`[${strategyKey}] Market OVER_UNDER_25 not found for event ${trade.betfair_event_id}`);
+    return null;
+  }
+
+  const runner = market.runners.find(r => r.runnerName === UNDER_RUNNER_NAME || r.runnerName === 'Under 2.5 Goals');
+  if (!runner) {
+    logger.warn(`[${strategyKey}] Runner ${UNDER_RUNNER_NAME} not found in market ${market.marketId}`);
+    return null;
+  }
+
+  await supabase
+    .from('strategy_trades')
+    .update({
+      betfair_market_id: market.marketId,
+      selection_id: runner.selectionId,
+    })
+    .eq('id', trade.id);
+
+  return { marketId: market.marketId, selectionId: runner.selectionId };
+}
+
+module.exports = {
+  // Constants
+  SOCCER_EVENT_TYPE_ID,
+  UNDER_RUNNER_NAME,
+  COMPETITION_MATCHERS,
+  COMPETITION_IDS,
+  
+  // Calculations
+  calculateLayStake,
+  calculateHedgeStake,
+  computeTargetLayPrice,
+  computeRealisedPnlSnapshot,
+  
+  // Naming
+  formatFixtureName,
+  
+  // Tick helpers
+  ticksBelow,
+  ticksAbove,
+  isWithinTicks,
+  getMiddlePrice,
+  
+  // API wrappers
+  createSafeApiWrappers,
+  
+  // Market resolution
+  ensureMarket,
+};
+

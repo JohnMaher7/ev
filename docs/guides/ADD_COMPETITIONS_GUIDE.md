@@ -254,6 +254,7 @@ ssh root@136.244.65.92 "systemctl restart ev-betfair-bot"
 | La Liga | `La Liga` | `117` (unverified) |
 | Bundesliga | `Bundesliga` | `59` (unverified) |
 | Ligue 1 | `Ligue 1` | `55` (unverified) |
+| Champions League | `UEFA Champions League` | `228` (verify via script) |
 
 ⚠️ **ALWAYS VERIFY** with Step 1 before using!
 

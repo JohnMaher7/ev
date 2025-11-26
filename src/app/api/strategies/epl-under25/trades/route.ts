@@ -3,14 +3,18 @@ import { NextRequest, NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
 import { config } from '@/lib/config';
 
-const STRATEGY_KEY = config.strategies.eplUnder25.key;
+// Support both strategies
+const STRATEGY_KEYS = [
+  config.strategies.eplUnder25.key,
+  config.strategies.eplUnder25GoalReact.key,
+];
 
 function demoTrades() {
   const now = Date.now();
   return [
     {
       id: 'demo-trade-1',
-      strategy_key: STRATEGY_KEY,
+      strategy_key: config.strategies.eplUnder25.key,
       event_id: 'demo-event',
       betfair_event_id: '30000012345',
       betfair_market_id: '1.234567890',
@@ -41,7 +45,7 @@ function demoTrades() {
     },
     {
       id: 'demo-trade-2',
-      strategy_key: STRATEGY_KEY,
+      strategy_key: config.strategies.eplUnder25.key,
       event_id: 'demo-event-2',
       betfair_event_id: '30000067890',
       betfair_market_id: '1.987654321',
@@ -70,6 +74,37 @@ function demoTrades() {
       realised_pnl: 2.1,
       settled_at: new Date(now - 2 * 60 * 60 * 1000).toISOString(),
     },
+    {
+      id: 'demo-trade-3',
+      strategy_key: config.strategies.eplUnder25GoalReact.key,
+      event_id: 'demo-event-3',
+      betfair_event_id: '30000011111',
+      betfair_market_id: '1.111111111',
+      selection_id: 111111,
+      runner_name: 'Under 2.5 Goals',
+      kickoff_at: new Date(now - 30 * 60 * 1000).toISOString(),
+      status: 'live',
+      back_price: 3.2,
+      back_size: 100,
+      lay_price: null,
+      lay_size: null,
+      pnl: null,
+      margin: null,
+      commission_paid: null,
+      created_at: new Date(now - 60 * 60 * 1000).toISOString(),
+      updated_at: new Date(now - 5 * 60 * 1000).toISOString(),
+      last_error: null,
+      home: 'Tottenham',
+      away: 'Newcastle',
+      competition: 'English Premier League',
+      competition_name: 'English Premier League',
+      event_name: 'Tottenham v Newcastle',
+      back_price_snapshot: 3.2,
+      back_stake: 100,
+      total_stake: 100,
+      realised_pnl: null,
+      settled_at: null,
+    },
   ];
 }
 
@@ -81,13 +116,14 @@ export async function GET(request: NextRequest) {
 
     const { searchParams } = new URL(request.url);
     const status = searchParams.get('status');
+    const strategyKey = searchParams.get('strategy_key'); // Filter by specific strategy
     const cursor = searchParams.get('cursor');
     const limit = parseInt(searchParams.get('limit') || '50', 10);
 
     let query = supabaseAdmin
       .from('strategy_trades')
       .select('*')
-      .eq('strategy_key', STRATEGY_KEY)
+      .in('strategy_key', strategyKey ? [strategyKey] : STRATEGY_KEYS)
       .order('kickoff_at', { ascending: true })
       .limit(limit);
 
@@ -112,16 +148,16 @@ export async function GET(request: NextRequest) {
       if (uniqueEventIds.length > 0) {
         const { data: fixtures, error: fixtureError } = await supabaseAdmin
           .from('strategy_fixtures')
-          .select('betfair_event_id, home, away, competition')
-          .eq('strategy_key', STRATEGY_KEY)
+          .select('betfair_event_id, home, away, competition, strategy_key')
+          .in('strategy_key', STRATEGY_KEYS)
           .in('betfair_event_id', uniqueEventIds);
 
         if (!fixtureError && fixtures) {
           const fixtureMap = new Map();
-          fixtures.forEach((f) => fixtureMap.set(f.betfair_event_id, f));
+          fixtures.forEach((f) => fixtureMap.set(`${f.strategy_key}-${f.betfair_event_id}`, f));
 
           enrichedData = data.map((trade) => {
-            const fixture = fixtureMap.get(trade.betfair_event_id);
+            const fixture = fixtureMap.get(`${trade.strategy_key}-${trade.betfair_event_id}`);
             const competitionName = trade.competition_name || fixture?.competition || 'English Premier League';
             const eventName =
               trade.event_name ||
@@ -173,8 +209,8 @@ export async function POST(request: NextRequest) {
       .from('strategy_trades')
       .update({ status: 'cancelled', last_error: 'MANUAL_CANCEL' })
       .in('id', body.ids)
-      .eq('strategy_key', STRATEGY_KEY)
-      .neq('status', 'hedged');
+      .in('strategy_key', STRATEGY_KEYS)
+      .not('status', 'in', '("hedged","completed")');
 
     if (error) throw new Error(error.message);
 

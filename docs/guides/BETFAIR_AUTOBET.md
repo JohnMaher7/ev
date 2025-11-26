@@ -121,6 +121,56 @@ npm start
   - `GET /version` → `betfair-bot:1`
 - On the VPS, expose port 3000 if needed. Hitting `/health` confirms the bot is live and has a session.
 
+## EPL Under 2.5 Strategies
+
+The bot includes two automated strategies for trading Under 2.5 Goals markets:
+
+### Strategy 1: Pre-Match Hedge (`epl_under25`)
+
+Places a back bet 30 minutes before kickoff at the lay price, then immediately places a lay order 2 ticks below to lock in profit if matched in-play.
+
+**Environment Variables:**
+```
+ENABLE_EPL_UNDER25_STRATEGY=true
+EPL_UNDER25_DEFAULT_STAKE=150
+EPL_UNDER25_MIN_BACK_PRICE=1.8
+EPL_UNDER25_BACK_LEAD_MINUTES=30
+EPL_UNDER25_LAY_TICKS_BELOW=2
+EPL_UNDER25_LAY_PERSISTENCE=PERSIST  # Keep lay order in-play
+```
+
+### Strategy 2: Goal Reactive (`epl_under25_goalreact`)
+
+Wakes at kickoff, monitors in-play games for 1st goal (30% price spike), waits 90 seconds for price to settle, then enters a back position if price is between 2.5-5.0. Exits on 10% profit or 15% stop-loss after 2nd goal.
+
+**Flow:**
+1. **WATCHING** - Poll every 30s, detect 30% price spike
+2. **GOAL_WAIT** - Wait 90s for price to settle, skip if goal after 45 mins
+3. **LIVE** - Exit on 10% profit drop or 2nd goal detection
+4. **STOP_LOSS_WAIT** - Wait 90s after 2nd goal
+5. **STOP_LOSS_ACTIVE** - Exit when price drops 15% below settled price
+
+**Environment Variables:**
+```
+ENABLE_EPL_UNDER25_GOALREACT_STRATEGY=true
+GOALREACT_DEFAULT_STAKE=100
+GOALREACT_WAIT_AFTER_GOAL=90
+GOALREACT_GOAL_CUTOFF=45
+GOALREACT_MIN_ENTRY_PRICE=2.5
+GOALREACT_MAX_ENTRY_PRICE=5.0
+GOALREACT_GOAL_DETECTION_PCT=30
+GOALREACT_PROFIT_TARGET_PCT=10
+GOALREACT_STOP_LOSS_PCT=15
+GOALREACT_POLL_INTERVAL=30
+```
+
+### Dashboard
+
+Both strategies appear in the EPL Under 2.5 dashboard (`/strategies/epl-under25`) with:
+- Strategy tag (Pre-Match Hedge / Goal Reactive)
+- Expandable event log per trade showing timestamps, prices, and state transitions
+- Filter by strategy and status
+
 ## Testing
 
 - CI: `npm run test:ci` (unit tests cover odds/alerts; network calls require proper envs when executed).

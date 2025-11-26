@@ -58,6 +58,7 @@ export const config = {
   strategies: {
     eplUnder25: {
       key: 'epl_under25',
+      name: 'Pre-Match Hedge',
       enabled: process.env.ENABLE_EPL_UNDER25_STRATEGY === 'true',
       defaultStake: parseFloat(process.env.EPL_UNDER25_DEFAULT_STAKE || '10'),
       minBackPrice: parseFloat(process.env.EPL_UNDER25_MIN_BACK_PRICE || '2.0'),
@@ -65,6 +66,19 @@ export const config = {
       backLeadMinutes: parseInt(process.env.EPL_UNDER25_BACK_LEAD_MINUTES || '30', 10),
       fixtureLookaheadDays: parseInt(process.env.EPL_UNDER25_FIXTURE_LOOKAHEAD_DAYS || '7', 10),
       commissionRate: parseFloat(process.env.EPL_UNDER25_COMMISSION_RATE || '0.02'),
+    },
+    eplUnder25GoalReact: {
+      key: 'epl_under25_goalreact',
+      name: 'Goal Reactive',
+      enabled: process.env.ENABLE_EPL_UNDER25_GOALREACT_STRATEGY === 'true',
+      defaultStake: parseFloat(process.env.GOALREACT_DEFAULT_STAKE || '100'),
+      waitAfterGoalSeconds: parseInt(process.env.GOALREACT_WAIT_AFTER_GOAL || '90', 10),
+      goalCutoffMinutes: parseInt(process.env.GOALREACT_GOAL_CUTOFF || '45', 10),
+      minEntryPrice: parseFloat(process.env.GOALREACT_MIN_ENTRY_PRICE || '2.5'),
+      maxEntryPrice: parseFloat(process.env.GOALREACT_MAX_ENTRY_PRICE || '5.0'),
+      goalDetectionPct: parseFloat(process.env.GOALREACT_GOAL_DETECTION_PCT || '30'),
+      profitTargetPct: parseFloat(process.env.GOALREACT_PROFIT_TARGET_PCT || '10'),
+      stopLossPct: parseFloat(process.env.GOALREACT_STOP_LOSS_PCT || '15'),
     },
   },
 } as const;

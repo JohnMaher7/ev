@@ -39,6 +39,7 @@ const {
 } = require('./lib/betfair-session');
 const { roundToBetfairTick, findBestMatch } = require('./lib/betfair-utils');
 const { createEplUnder25Strategy } = require('./lib/strategies/epl-under25');
+const { createEplUnder25GoalReactStrategy } = require('./lib/strategies/epl-under25-goalreact');
 
 initializeSessionManager({ logger: console });
 
@@ -162,6 +163,7 @@ async function main() {
       logger: console,
     };
 
+    // Strategy 1: Pre-match hedge (back at lay price, immediate lay 2 ticks below)
     if (process.env.ENABLE_EPL_UNDER25_STRATEGY === 'true') {
       eplStrategy = createEplUnder25Strategy(strategyDeps);
       eplStrategy.start().catch((err) => {
@@ -169,6 +171,17 @@ async function main() {
       });
     } else {
       console.log('[strategy:epl_under25] disabled (ENABLE_EPL_UNDER25_STRATEGY != true)');
+    }
+
+    // Strategy 2: Goal-reactive (wake at kickoff, detect goals, enter post-goal)
+    let goalReactStrategy = null;
+    if (process.env.ENABLE_EPL_UNDER25_GOALREACT_STRATEGY === 'true') {
+      goalReactStrategy = createEplUnder25GoalReactStrategy(strategyDeps);
+      goalReactStrategy.start().catch((err) => {
+        console.error('[strategy:epl_under25_goalreact] failed to start:', err && err.message ? err.message : err);
+      });
+    } else {
+      console.log('[strategy:epl_under25_goalreact] disabled (ENABLE_EPL_UNDER25_GOALREACT_STRATEGY != true)');
     }
 
     const seenCandidateIds = [];
@@ -481,6 +494,11 @@ async function main() {
       if (eplStrategy) {
         eplStrategy.stop().catch((err) => {
           console.warn('[strategy:epl_under25] stop error:', err && err.message ? err.message : err);
+        });
+      }
+      if (goalReactStrategy) {
+        goalReactStrategy.stop().catch((err) => {
+          console.warn('[strategy:epl_under25_goalreact] stop error:', err && err.message ? err.message : err);
         });
       }
       server.close();

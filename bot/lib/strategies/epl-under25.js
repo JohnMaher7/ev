@@ -1,78 +1,39 @@
 const { addDays } = require('date-fns');
 
 const { roundToBetfairTick } = require('../betfair-utils');
+const {
+  SOCCER_EVENT_TYPE_ID,
+  UNDER_RUNNER_NAME,
+  COMPETITION_MATCHERS,
+  COMPETITION_IDS,
+  calculateLayStake,
+  calculateHedgeStake,
+  computeRealisedPnlSnapshot,
+  formatFixtureName,
+  ticksBelow,
+  createSafeApiWrappers,
+  ensureMarket,
+} = require('./shared');
 
 const STRATEGY_KEY = 'epl_under25';
-const SOCCER_EVENT_TYPE_ID = '1';
-const UNDER_RUNNER_NAME = 'Under 2.5 Goals';
-// Strict matching for English Premier League ONLY
-const COMPETITION_MATCHERS = [/^English Premier League$/i];
-const EPL_COMPETITION_IDS = ['10932509']; // Betfair's EPL competition ID
 
 function getDefaultSettings() {
   return {
-    default_stake: parseFloat(process.env.EPL_UNDER25_DEFAULT_STAKE || '10'),
-    min_back_price: parseFloat(process.env.EPL_UNDER25_MIN_BACK_PRICE || '2.0'),
-    lay_target_price: parseFloat(process.env.EPL_UNDER25_LAY_TARGET_PRICE || '1.9'), // Fallback if profit pct not used
+    default_stake: parseFloat(process.env.EPL_UNDER25_DEFAULT_STAKE || '150'),
+    fixture_lookahead_days: parseInt(process.env.EPL_UNDER25_FIXTURE_LOOKAHEAD_DAYS || '7', 10),
+    commission_rate: parseFloat(process.env.EPL_UNDER25_COMMISSION_RATE || '0.0175'),
+    // Strategy-specific settings (stored in extra JSONB)
+    min_back_price: parseFloat(process.env.EPL_UNDER25_MIN_BACK_PRICE || '1.8'),
     min_profit_pct: parseFloat(process.env.EPL_UNDER25_MIN_PROFIT_PCT || '10'),
     back_lead_minutes: parseInt(process.env.EPL_UNDER25_BACK_LEAD_MINUTES || '30', 10),
-    fixture_lookahead_days: parseInt(process.env.EPL_UNDER25_FIXTURE_LOOKAHEAD_DAYS || '7', 10),
-    commission_rate: parseFloat(process.env.EPL_UNDER25_COMMISSION_RATE || '0.02'),
+    lay_ticks_below_back: parseInt(process.env.EPL_UNDER25_LAY_TICKS_BELOW || '2', 10),
+    lay_persistence: process.env.EPL_UNDER25_LAY_PERSISTENCE || 'PERSIST', // PERSIST = keep in-play
   };
 }
 
-function calculateLayStake({ backStake, backPrice, layPrice, commission = 0.02 }) {
-  if (!backStake || !backPrice || !layPrice) {
-    return { layStake: 0, profitBack: 0, profitLay: 0 };
-  }
-  const denom = layPrice - commission;
-  if (denom <= 0) {
-    return { layStake: 0, profitBack: 0, profitLay: 0 };
-  }
-  const rawStake = (backStake * backPrice) / denom;
-  const layStake = Math.max(0, Math.round(rawStake * 100) / 100);
-  const grossWin = backStake * (backPrice - 1);
-  const hedgeLoss = layStake * (layPrice - 1);
-  const profitBack = Number((grossWin - hedgeLoss).toFixed(2));
-  const profitLay = Number(((layStake * (1 - commission)) - backStake).toFixed(2));
-  return {
-    layStake,
-    profitBack,
-    profitLay,
-  };
-}
+// calculateLayStake and calculateHedgeStake imported from shared.js
 
-/**
- * Helper to calculate hedge stake from market book
- * @param {Object} book - Market book object
- * @param {string|number} selectionId - Runner selection ID
- * @param {number} backStake - Original back stake
- * @param {number} backPrice - Original back price
- * @param {number} commission - Commission rate (0.02 default)
- * @param {number} [overrideLayPrice] - Optional override for lay price (e.g. for limit orders at target)
- */
-function calculateHedgeStake(book, selectionId, backStake, backPrice, commission = 0.02, overrideLayPrice = null) {
-  const runner = book?.runners?.find(r => r.selectionId == selectionId);
-  if (!runner) return { layStake: 0, layPrice: 0 };
-
-  // Use best available lay price if not overridden
-  const marketLayPrice = runner.ex?.availableToLay?.[0]?.price;
-  const effectiveLayPrice = overrideLayPrice || marketLayPrice;
-
-  if (!effectiveLayPrice) return { layStake: 0, layPrice: 0 };
-
-  const result = calculateLayStake({
-    backStake,
-    backPrice,
-    layPrice: effectiveLayPrice,
-    commission
-  });
-
-  return {
-    ...result,
-    layPrice: effectiveLayPrice
-  };
-}
+// computeTargetLayPrice, formatFixtureName, computeRealisedPnlSnapshot imported from shared.js
 
 function computeTargetLayPrice(backPrice, settings) {
   // Profit locking logic: Target Price = Back Price / (1 + Profit%)
@@ -80,23 +41,6 @@ function computeTargetLayPrice(backPrice, settings) {
   const profitPct = settings?.min_profit_pct || 10;
   const target = backPrice / (1 + (profitPct / 100));
   return roundToBetfairTick(target);
-}
-
-function formatFixtureName(home, away, fallback = null) {
-  if (home && away) {
-    return `${home} v ${away}`;
-  }
-  return fallback || null;
-}
-
-function computeRealisedPnlSnapshot({ backStake, backPrice, layStake, layPrice, commission = 0.02 }) {
-  if (!backStake || !backPrice || !layStake || !layPrice) {
-    return null;
-  }
-  const profitBack = backStake * (backPrice - 1) - layStake * (layPrice - 1);
-  const profitLay = (layStake * (1 - commission)) - backStake;
-  const realised = Math.min(profitBack, profitLay);
-  return Number(realised.toFixed(2));
 }
 
 class EplUnder25Strategy {
@@ -283,12 +227,13 @@ class EplUnder25Strategy {
     if (scheduledTrades?.length > 0) {
       const kickoff = new Date(scheduledTrades[0].kickoff_at).getTime();
       const leadTime = (this.settings?.back_lead_minutes || 30) * 60 * 1000;
-      const wakeTime = kickoff - leadTime - (60 * 1000); // Wake 1min before window opens
-      const delay = wakeTime - now;
+      const windowStartTime = kickoff - leadTime; // When trade window opens
+      const delay = windowStartTime - now;
       
-      if (delay <= 0) {
-        this.logger.log(`[strategy:epl_under25] Trade window is open - process scheduled trades now`);
-        return 0; // Trade window is open
+      // Check if trade window is already open (or about to open within 10s)
+      if (delay <= 10000) {
+        this.logger.log(`[strategy:epl_under25] Trade window is OPEN - process scheduled trades now`);
+        return 0; // Trade window is open/opening - process immediately
       }
       
       // Cap between 1 minute and 24 hours
@@ -318,7 +263,7 @@ class EplUnder25Strategy {
       const nextWake = await this.calculateNextWakeTime();
       
       if (nextWake === 0) {
-        // Immediate action needed
+        // Immediate action needed - trade window is open or in-play games active
         
         // Check if we need active polling (for in-play games)
         const { data: activeTrades } = await this.supabase
@@ -338,18 +283,10 @@ class EplUnder25Strategy {
         // Process scheduled trades (place bets if in window)
         await this.processScheduledTrades('smart-scheduler');
         
-        // Check again in 5s (tight loop when action needed)
+        // IMPORTANT: Recalculate next wake time instead of blindly checking every 30s
+        // After placing bets, we should sleep until kickoff (when back_pending orders need checking)
+        // This prevents wasting resources polling games outside the window
         this.smartSchedulerTimer = setTimeout(() => this.smartSchedulerLoop(), 5000);
-        
-      } else if (nextWake < 5 * 60 * 1000) {
-        // Less than 5 minutes until next action - frequent checks
-        this.logger.log(`[strategy:epl_under25] Smart scheduler: ${(nextWake/1000).toFixed(0)}s until next action - checking frequently`);
-        
-        // Process scheduled trades to catch any in window
-        await this.processScheduledTrades('smart-scheduler');
-        
-        // Check again in 30s
-        this.smartSchedulerTimer = setTimeout(() => this.smartSchedulerLoop(), 30000);
         
       } else {
         // More than 5 minutes away - go to sleep
@@ -360,8 +297,10 @@ class EplUnder25Strategy {
         this.stopActivePolling();
         
         // Sleep until calculated wake time
+        // IMPORTANT: When we wake up, we MUST check if trade window is open
         this.smartSchedulerTimer = setTimeout(() => {
           this.logger.log(`[strategy:epl_under25] Smart scheduler: WAKING UP - checking for work`);
+          // Immediately recalculate and process - don't wait for next cycle
           this.smartSchedulerLoop();
         }, nextWake);
       }
@@ -374,29 +313,29 @@ class EplUnder25Strategy {
   }
 
   /**
-   * Start active 5-second polling for in-play games
+   * Start active 30-second polling for in-play games
    * Only called when games are actually in-play
    */
   startActivePolling() {
     if (this.activePollingTimer) return; // Already running
     
-    this.logger.log('[strategy:epl_under25] ▶ STARTING active 5s polling (in-play games detected)');
+    this.logger.log('[strategy:epl_under25] ▶ STARTING active 30s polling (in-play games detected)');
     
     this.activePollingTimer = setInterval(() => {
       this.processActiveTrades('smart-active').catch(this.logError('processActiveTrades'));
-    }, 5 * 1000);
+    }, 30 * 1000);
     
     // Run immediately
     this.processActiveTrades('smart-active-immediate').catch(this.logError('processActiveTrades'));
   }
 
   /**
-   * Stop active 5-second polling when no in-play games
+   * Stop active 30-second polling when no in-play games
    * Saves database queries
    */
   stopActivePolling() {
     if (this.activePollingTimer) {
-      this.logger.log('[strategy:epl_under25] ⏸ STOPPING active 5s polling (no in-play games)');
+      this.logger.log('[strategy:epl_under25] ⏸ STOPPING active 30s polling (no in-play games)');
       clearInterval(this.activePollingTimer);
       this.activePollingTimer = null;
     }
@@ -521,12 +460,15 @@ class EplUnder25Strategy {
         strategy_key: STRATEGY_KEY,
         enabled: true,
         default_stake: this.defaults.default_stake,
-        min_back_price: this.defaults.min_back_price,
-        lay_target_price: this.defaults.lay_target_price,
-        min_profit_pct: this.defaults.min_profit_pct,
-        back_lead_minutes: this.defaults.back_lead_minutes,
         fixture_lookahead_days: this.defaults.fixture_lookahead_days,
         commission_rate: this.defaults.commission_rate,
+        extra: {
+          min_back_price: this.defaults.min_back_price,
+          min_profit_pct: this.defaults.min_profit_pct,
+          back_lead_minutes: this.defaults.back_lead_minutes,
+          lay_ticks_below_back: this.defaults.lay_ticks_below_back,
+          lay_persistence: this.defaults.lay_persistence,
+        },
       };
       const { data: created, error: insertErr } = await this.supabase
         .from('strategy_settings')
@@ -534,17 +476,57 @@ class EplUnder25Strategy {
         .select()
         .single();
       if (insertErr) throw insertErr;
-      this.settings = created;
+      this.settings = { ...created, ...created.extra };
     } else {
-      this.settings = data;
-      // Patch missing columns if needed
-      if (this.settings.min_profit_pct === undefined) {
-        this.logger.log('[strategy:epl_under25] patching missing min_profit_pct setting');
+      // Merge top-level and extra fields (extra takes precedence)
+      this.settings = { ...data, ...(data.extra || {}) };
+      
+      // Auto-sync env var changes to database (for operational flexibility)
+      const updates = {};
+      const extraUpdates = {};
+      let needsUpdate = false;
+      
+      // Check common settings
+      if (this.settings.default_stake !== this.defaults.default_stake) {
+        this.logger.log(`[strategy:epl_under25] Syncing default_stake: ${this.settings.default_stake} → ${this.defaults.default_stake} (from env var)`);
+        updates.default_stake = this.defaults.default_stake;
+        needsUpdate = true;
+      }
+      
+      // Check strategy-specific settings in extra
+      if ((this.settings.min_back_price || this.defaults.min_back_price) !== this.defaults.min_back_price) {
+        this.logger.log(`[strategy:epl_under25] Syncing min_back_price: ${this.settings.min_back_price} → ${this.defaults.min_back_price} (from env var)`);
+        extraUpdates.min_back_price = this.defaults.min_back_price;
+        needsUpdate = true;
+      }
+      if ((this.settings.min_profit_pct || this.defaults.min_profit_pct) !== this.defaults.min_profit_pct) {
+        this.logger.log(`[strategy:epl_under25] Syncing min_profit_pct: ${this.settings.min_profit_pct} → ${this.defaults.min_profit_pct} (from env var)`);
+        extraUpdates.min_profit_pct = this.defaults.min_profit_pct;
+        needsUpdate = true;
+      }
+      if ((this.settings.back_lead_minutes || this.defaults.back_lead_minutes) !== this.defaults.back_lead_minutes) {
+        this.logger.log(`[strategy:epl_under25] Syncing back_lead_minutes: ${this.settings.back_lead_minutes} → ${this.defaults.back_lead_minutes} (from env var)`);
+        extraUpdates.back_lead_minutes = this.defaults.back_lead_minutes;
+        needsUpdate = true;
+      }
+      
+      if (needsUpdate) {
+        if (Object.keys(extraUpdates).length > 0) {
+          // Merge with existing extra
+          const currentExtra = data.extra || {};
+          updates.extra = { ...currentExtra, ...extraUpdates };
+        }
+        
         await this.supabase
           .from('strategy_settings')
-          .update({ min_profit_pct: this.defaults.min_profit_pct })
+          .update(updates)
           .eq('strategy_key', STRATEGY_KEY);
-        this.settings.min_profit_pct = this.defaults.min_profit_pct;
+        
+        // Update local settings
+        Object.assign(this.settings, updates);
+        if (updates.extra) {
+          Object.assign(this.settings, updates.extra);
+        }
       }
     }
   }
@@ -586,7 +568,7 @@ class EplUnder25Strategy {
 
       const sessionToken = await this.requireSessionWithRetry(`fixtures-${trigger}`);
 
-      // 1. Get competitions - find EPL competition ID
+      // 1. Get competitions - find league competition IDs
       const competitionsRes = await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/listCompetitions', {
         filter: { eventTypeIds: [SOCCER_EVENT_TYPE_ID] },
       }, 'listCompetitions');
@@ -597,7 +579,7 @@ class EplUnder25Strategy {
         .filter((c) => COMPETITION_MATCHERS.some((rx) => rx.test(c.competition?.name || '')));
 
       if (matchedCompetitions.length > 0) {
-        this.logger.log(`[strategy:epl_under25] ✓ Matched EPL competitions: ${matchedCompetitions.map(c => `"${c.competition?.name}" (ID: ${c.competition?.id})`).join(', ')}`);
+        this.logger.log(`[strategy:epl_under25] ✓ Matched competitions: ${matchedCompetitions.map(c => `"${c.competition?.name}" (ID: ${c.competition?.id})`).join(', ')}`);
       } else {
         this.logger.warn(`[strategy:epl_under25] ⚠️ No competitions matched regex patterns: ${COMPETITION_MATCHERS.map(r => r.toString()).join(', ')}`);
         this.logger.log(`[strategy:epl_under25] Available competitions (first 15): ${(competitionsRes || []).slice(0,15).map(c => `"${c.competition?.name}" (ID: ${c.competition?.id})`).join(', ')}`);
@@ -607,21 +589,39 @@ class EplUnder25Strategy {
         .map((c) => c.competition?.id)
         .filter(Boolean);
 
-      // Use matched IDs, fallback to hardcoded EPL ID if no regex match
+      // Build competition ID -> name map for later use
+      const competitionIdToName = new Map();
+      matchedCompetitions.forEach(c => {
+        if (c.competition?.id && c.competition?.name) {
+          competitionIdToName.set(String(c.competition.id), c.competition.name);
+        }
+      });
+
+      // Use matched IDs, fallback to hardcoded competition IDs if no regex match
       let competitionIds = matchedCompetitionIds;
       if (competitionIds.length === 0) {
-        this.logger.warn(`[strategy:epl_under25] Using hardcoded EPL competition ID: ${EPL_COMPETITION_IDS.join(', ')}`);
-        competitionIds = EPL_COMPETITION_IDS;
+        this.logger.warn(`[strategy:epl_under25] Using hardcoded competition IDs: ${COMPETITION_IDS.join(', ')}`);
+        competitionIds = COMPETITION_IDS;
+        // Add hardcoded names for fallback
+        competitionIds.forEach(id => {
+          if (!competitionIdToName.has(id)) {
+            if (id === '10932509') competitionIdToName.set(id, 'English Premier League');
+            else if (id === '59') competitionIdToName.set(id, 'German Bundesliga');
+            else if (id === '117') competitionIdToName.set(id, 'Spanish La Liga');
+            else if (id === '81') competitionIdToName.set(id, 'Italian Serie A');
+            else if (id === '228') competitionIdToName.set(id, 'UEFA Champions League');
+          }
+        });
       }
 
       if (!competitionIds.length) {
-        this.logger.error(`[strategy:${STRATEGY_KEY}] CRITICAL: No EPL competition IDs available - cannot proceed`);
+        this.logger.error(`[strategy:${STRATEGY_KEY}] CRITICAL: No competition IDs available - cannot proceed`);
         return;
       }
 
       this.logger.log(`[strategy:epl_under25] Using competition IDs for event sync: ${competitionIds.join(', ')}`);
 
-      // 2. Get events - Betfair API filters by competitionIds, ensuring only EPL events
+      // 2. Get events - Betfair API filters by competitionIds, ensuring only matched league events
       const eventsRes = await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/listEvents', {
         filter: {
           eventTypeIds: [SOCCER_EVENT_TYPE_ID],
@@ -636,7 +636,35 @@ class EplUnder25Strategy {
 
       this.logger.log(`[strategy:epl_under25] listEvents returned ${eventsRes?.length || 0} events for competition IDs: ${competitionIds.join(', ')}`);
       
-      // Build fixture map - all events are from EPL because of competitionIds filter
+      // Fetch market catalogues to get competition info for each event
+      // listEvents doesn't include competition info, so we need to get it from markets
+      const eventIds = (eventsRes || []).map(evt => evt.event?.id).filter(Boolean);
+      const eventIdToCompetition = new Map();
+      
+      if (eventIds.length > 0) {
+        try {
+          const marketCatalogues = await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/listMarketCatalogue', {
+            filter: {
+              eventIds: eventIds,
+              marketTypeCodes: ['OVER_UNDER_25'],
+            },
+            maxResults: 1000,
+            marketProjection: ['EVENT', 'COMPETITION'],
+          }, 'listMarketCatalogue-competition');
+          
+          // Extract competition info from market catalogues
+          (marketCatalogues || []).forEach(market => {
+            if (market.event?.id && market.competition?.id && market.competition?.name) {
+              const compName = competitionIdToName.get(String(market.competition.id)) || market.competition.name;
+              eventIdToCompetition.set(market.event.id, compName);
+            }
+          });
+        } catch (err) {
+          this.logger.warn(`[strategy:epl_under25] Failed to fetch competition info from markets: ${err.message}`);
+        }
+      }
+      
+      // Build fixture map - all events are from matched leagues because of competitionIds filter
       const fixtureMap = new Map();
       
       (eventsRes || []).forEach((evt) => {
@@ -647,13 +675,24 @@ class EplUnder25Strategy {
         const home = parts[0]?.trim() || null;
         const away = parts[1]?.trim() || null;
         
-        this.logger.log(`[strategy:epl_under25] Adding EPL fixture: ${eventName} (kickoff: ${evt.event?.openDate})`);
+        // Get competition name from event-to-competition map or fallback
+        let competitionName = eventIdToCompetition.get(evt.event.id);
+        if (!competitionName) {
+          // Fallback: if only one competition matched, use that name
+          if (competitionIdToName.size === 1) {
+            competitionName = Array.from(competitionIdToName.values())[0];
+          } else {
+            competitionName = 'Multiple Leagues'; // Generic fallback
+          }
+        }
+        
+        this.logger.log(`[strategy:epl_under25] Adding fixture (${competitionName}): ${eventName} (kickoff: ${evt.event?.openDate})`);
         
         fixtureMap.set(evt.event.id, {
           strategy_key: STRATEGY_KEY,
           betfair_event_id: evt.event.id,
           event_id: evt.event.id,
-          competition: 'English Premier League',
+          competition: competitionName,
           home,
           away,
           kickoff_at: evt.event?.openDate,
@@ -752,7 +791,7 @@ class EplUnder25Strategy {
       return existing.id;
     }
 
-    const competitionName = fixture.competition || 'English Premier League';
+    const competitionName = fixture.competition || 'Unknown';
     const eventName = formatFixtureName(fixture.home, fixture.away, fixture.event_id || fixture.betfair_event_id);
 
     // Create new trade record
@@ -766,7 +805,7 @@ class EplUnder25Strategy {
       kickoff_at: fixture.kickoff_at,
       status: 'scheduled',
       target_stake: this.settings.default_stake,
-      hedge_target_price: this.settings.lay_target_price,
+      hedge_target_price: null, // Will be computed when back is matched
     };
     const { data, error: insertErr } = await this.supabase
       .from('strategy_trades')
@@ -781,7 +820,7 @@ class EplUnder25Strategy {
   async pruneFixtures(validEventIds = new Set()) {
     const keepSet = validEventIds instanceof Set ? validEventIds : new Set(validEventIds || []);
     if (!keepSet.size) {
-      this.logger.log('[strategy:epl_under25] Fixture prune skipped (no EPL ids fetched).');
+      this.logger.log('[strategy:epl_under25] Fixture prune skipped (no league ids fetched).');
       return;
     }
 
@@ -804,13 +843,13 @@ class EplUnder25Strategy {
       .in('betfair_event_id', staleIds);
     if (deleteErr) throw deleteErr;
 
-    this.logger.log(`[strategy:epl_under25] Pruned ${staleIds.length} stale fixtures outside EPL scope.`);
+    this.logger.log(`[strategy:epl_under25] Pruned ${staleIds.length} stale fixtures outside league scope.`);
   }
 
   async pruneStaleTrades(validEventIds = new Set()) {
     const keepSet = validEventIds instanceof Set ? validEventIds : new Set(validEventIds || []);
     if (!keepSet.size) {
-      this.logger.log('[strategy:epl_under25] Trade prune skipped (no EPL ids fetched).');
+      this.logger.log('[strategy:epl_under25] Trade prune skipped (no league ids fetched).');
       return;
     }
 
@@ -827,15 +866,15 @@ class EplUnder25Strategy {
     const staleIds = stale.map((trade) => trade.id);
     const { error: updateErr } = await this.supabase
       .from('strategy_trades')
-      .update({ status: 'cancelled', last_error: 'PRUNED_NON_EPL' })
+      .update({ status: 'cancelled', last_error: 'PRUNED_OUT_OF_SCOPE' })
       .in('id', staleIds);
     if (updateErr) throw updateErr;
 
     for (const trade of stale) {
-      await this.logEvent(trade.id, 'TRADE_PRUNED', { reason: 'NOT_EPL', betfair_event_id: trade.betfair_event_id });
+      await this.logEvent(trade.id, 'TRADE_PRUNED', { reason: 'OUT_OF_SCOPE', betfair_event_id: trade.betfair_event_id });
     }
 
-    this.logger.warn(`[strategy:epl_under25] Cancelled ${staleIds.length} scheduled trades outside EPL scope.`);
+    this.logger.warn(`[strategy:epl_under25] Cancelled ${staleIds.length} scheduled trades outside league scope.`);
   }
 
   async processScheduledTrades(trigger = 'manual') {
@@ -1015,9 +1054,17 @@ class EplUnder25Strategy {
     const market = await this.ensureMarket(trade, sessionToken);
     if (!market) return; // Market not found or invalid
 
+    // Check if market has closed/settled (game ended)
+    const book = await this.getMarketBookSafe(market.marketId, sessionToken, `phase-${phase}-book`);
+    if (book && book.status === 'CLOSED') {
+      // Market closed - settle the trade with whatever outcome
+      this.logger.log(`[strategy:epl_under25] Market closed - settling trade (phase: ${phase})`);
+      await this.settleTradeWithPnl(trade, state);
+      return;
+    }
+
     // --- PHASE 1: INITIALIZATION & ORDER PLACEMENT ---
     if (phase === 'INITIAL') {
-      const book = await this.getMarketBookSafe(market.marketId, sessionToken, 'phase1-book');
       if (!book || !book.inplay) return; // Wait for in-play
 
       const targetPrice = computeTargetLayPrice(trade.back_price, this.settings);
@@ -1253,6 +1300,7 @@ class EplUnder25Strategy {
     const customerRef = `BACK-${Date.now()}`;
     
     try {
+        // STRATEGY 1: Place back at lay price
         const placeRes = await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/placeOrders', {
         marketId: market.marketId,
         customerRef,
@@ -1274,6 +1322,51 @@ class EplUnder25Strategy {
         if (report && report.status === 'SUCCESS') {
         this.logger.log(`[strategy:epl_under25] Placed BACK order @ LAY PRICE ${bestLayPrice} for ${trade.fixture_name} (back was ${bestBackPrice}, spread saved)`);
 
+        // STRATEGY 1: Immediately place lay order 2 ticks below back price (keep in-play)
+        const layTicksCount = this.settings.lay_ticks_below_back || this.defaults.lay_ticks_below_back || 2;
+        const layTargetPrice = ticksBelow(bestLayPrice, layTicksCount);
+        const layPersistence = this.settings.lay_persistence || this.defaults.lay_persistence || 'PERSIST';
+        
+        // Calculate lay stake for hedge
+        const { layStake } = calculateLayStake({
+          backStake: stake,
+          backPrice: bestLayPrice,
+          layPrice: layTargetPrice,
+          commission: this.settings.commission_rate || this.defaults.commission_rate,
+        });
+        
+        let layBetId = null;
+        let layPlaced = false;
+        
+        if (layStake > 0) {
+          const layCustomerRef = `LAY-${Date.now()}`;
+          const layRes = await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/placeOrders', {
+            marketId: market.marketId,
+            customerRef: layCustomerRef,
+            instructions: [
+              {
+                selectionId: market.selectionId,
+                side: 'LAY',
+                orderType: 'LIMIT',
+                limitOrder: {
+                  size: layStake,
+                  price: layTargetPrice,
+                  persistenceType: layPersistence,  // PERSIST = keep in-play
+                },
+              },
+            ],
+          }, 'placeLay-immediate');
+          
+          const layReport = layRes?.instructionReports?.[0];
+          if (layReport && layReport.status === 'SUCCESS') {
+            layBetId = layReport.betId;
+            layPlaced = true;
+            this.logger.log(`[strategy:epl_under25] ✓ Placed LAY order @ ${layTargetPrice} (${layTicksCount} ticks below back, persistence=${layPersistence}) - betId: ${layBetId}`);
+          } else {
+            this.logger.warn(`[strategy:epl_under25] ⚠️ LAY order failed: ${layReport?.errorCode || 'unknown'}`);
+          }
+        }
+
         await this.updateTrade(trade.id, {
             status: 'back_pending',  // Not matched yet - will check at kickoff
             back_price: bestLayPrice,
@@ -1285,19 +1378,35 @@ class EplUnder25Strategy {
             selection_id: market.selectionId,
             back_placed_at: new Date().toISOString(),
             needs_check_at: trade.kickoff_at,  // Check at kickoff
-            total_stake: stake,
+            total_stake: stake + (layPlaced ? layStake : 0),
+            // Lay order info
+            lay_order_ref: layBetId,
+            lay_price: layPlaced ? layTargetPrice : null,
+            lay_size: layPlaced ? layStake : null,
+            lay_placed_at: layPlaced ? new Date().toISOString() : null,
         });
 
         trade.back_price = bestLayPrice;
         trade.back_size = stake;
         trade.back_stake = stake;
         trade.back_price_snapshot = trade.back_price_snapshot || bestLayPrice;
-        trade.total_stake = stake;
+        trade.total_stake = stake + (layPlaced ? layStake : 0);
         trade.back_order_ref = report.betId;
         trade.betfair_market_id = market.marketId;
         trade.selection_id = market.selectionId;
+        if (layPlaced) {
+          trade.lay_order_ref = layBetId;
+          trade.lay_price = layTargetPrice;
+          trade.lay_size = layStake;
+        }
 
-        await this.logEvent(trade.id, 'BACK_PLACED', { price: bestLayPrice, stake, betId: report.betId, backPrice: bestBackPrice });
+        await this.logEvent(trade.id, 'BACK_PLACED', { 
+          price: bestLayPrice, 
+          stake, 
+          betId: report.betId, 
+          backPrice: bestBackPrice,
+          layOrder: layPlaced ? { price: layTargetPrice, stake: layStake, betId: layBetId, persistence: layPersistence } : null,
+        });
         } else {
         this.logger.error(`[strategy:epl_under25] Failed to place BACK order: ${report?.errorCode}`);
         await this.logEvent(trade.id, 'BACK_FAILED', { errorCode: report?.errorCode });
@@ -1366,30 +1475,59 @@ class EplUnder25Strategy {
             return;
         }
 
-        // Order still unmatched at/after kickoff - cancel it
+        // Order partially matched or still unmatched at/after kickoff
         if (now >= kickoff) {
-            this.logger.log(`[strategy:epl_under25] ✗ Back bet UNMATCHED at kickoff - cancelling and terminating trade`);
+            const matchedAmount = order.sizeMatched || 0;
+            const unmatchedAmount = (order.sizeRemaining || 0);
             
-            await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/cancelOrders', {
-                marketId: trade.betfair_market_id,
-                instructions: [{ betId: trade.back_order_ref }],
-            }, 'cancelBack-kickoff');
+            // Cancel any unmatched portion
+            if (unmatchedAmount > 0) {
+                this.logger.log(`[strategy:epl_under25] Cancelling unmatched portion (${unmatchedAmount} of ${trade.back_size})`);
+                await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/cancelOrders', {
+                    marketId: trade.betfair_market_id,
+                    instructions: [{ betId: trade.back_order_ref }],
+                }, 'cancelBack-kickoff');
+            }
             
-            await this.updateTrade(trade.id, { 
-              status: 'cancelled', 
-              back_stake: 0,
-              total_stake: trade.lay_size || 0,
-              last_error: 'BACK_UNMATCHED_AT_KICKOFF - bet placed at lay price did not match' 
-            });
-            trade.status = 'cancelled';
-            trade.back_stake = 0;
-            trade.total_stake = trade.lay_size || 0;
-            await this.logEvent(trade.id, 'BACK_CANCELLED', { 
-              order, 
-              reason: 'Unmatched at kickoff' 
-            });
-            
-            this.logger.log(`[strategy:epl_under25] Trade cancelled - no exposure`);
+            // If ANY amount matched, proceed with the matched amount
+            if (matchedAmount > 0) {
+                this.logger.log(`[strategy:epl_under25] ⚠️ Partial match: ${matchedAmount} matched of ${trade.back_size} - proceeding with matched amount`);
+                await this.updateTrade(trade.id, {
+                    status: 'back_matched',
+                    back_matched_size: matchedAmount,
+                    back_price: order.averagePriceMatched || order.price,
+                    back_stake: matchedAmount,
+                    total_stake: matchedAmount + (trade.lay_size || 0),
+                    last_error: null,
+                });
+                trade.status = 'back_matched';
+                trade.back_matched_size = matchedAmount;
+                trade.back_price = order.averagePriceMatched || order.price;
+                trade.back_stake = matchedAmount;
+                trade.total_stake = matchedAmount + (trade.lay_size || 0);
+                await this.logEvent(trade.id, 'BACK_PARTIALLY_MATCHED', { 
+                    order, 
+                    matchedAmount,
+                    unmatchedAmount 
+                });
+            } else {
+                // Completely unmatched - cancel and terminate
+                this.logger.log(`[strategy:epl_under25] ✗ Back bet COMPLETELY UNMATCHED at kickoff - terminating trade`);
+                await this.updateTrade(trade.id, { 
+                    status: 'cancelled', 
+                    back_stake: 0,
+                    total_stake: trade.lay_size || 0,
+                    last_error: 'BACK_UNMATCHED_AT_KICKOFF - no liquidity at target price' 
+                });
+                trade.status = 'cancelled';
+                trade.back_stake = 0;
+                trade.total_stake = trade.lay_size || 0;
+                await this.logEvent(trade.id, 'BACK_CANCELLED', { 
+                    order, 
+                    reason: 'Completely unmatched at kickoff' 
+                });
+                this.logger.log(`[strategy:epl_under25] Trade cancelled - no exposure`);
+            }
         }
     } catch (err) {
         this.logger.error(`[strategy:epl_under25] checkBackOrder error: ${err.message}`);
@@ -1402,6 +1540,13 @@ class EplUnder25Strategy {
     const minsToKick = (kickoff.getTime() - now.getTime()) / 60000;
     const leadTime = this.settings.back_lead_minutes || this.defaults.back_lead_minutes;
 
+    // Early return for trades outside window - don't clutter logs
+    if (minsToKick > leadTime) {
+      // Trade not in window yet - smart scheduler will wake us later
+      return;
+    }
+
+    // Only log trades that are in window or need action
     const fixtureName = trade.fixture_name || trade.event_id;
     const tradeRef = typeof trade.id === 'string'
       ? trade.id.slice(0, 8)
@@ -1417,10 +1562,6 @@ class EplUnder25Strategy {
 
     if (minsToKick <= leadTime && minsToKick > 0) {
       await this.placeBackOrder(trade, trigger);
-    } else if (minsToKick > leadTime) {
-      // Trade not in window yet - smart scheduler will wake us later
-      // Don't process this trade now (avoids checking tomorrow's games during today's window)
-      return;
     }
   }
 

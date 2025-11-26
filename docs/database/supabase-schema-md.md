@@ -1,4 +1,8 @@
-# Supabase Schema (EPL Under 2.5 Strategy)
+# Supabase Schema (EPL Under 2.5 Strategies)
+
+Supports two strategies:
+- `epl_under25` - Pre-match hedge strategy (back at lay price, immediate lay 2 ticks below)
+- `epl_under25_goalreact` - Goal-reactive strategy (enter after 1st goal, exit on profit/stop-loss)
 
 ```
 CREATE TABLE IF NOT EXISTS strategy_trades (
@@ -13,13 +17,22 @@ CREATE TABLE IF NOT EXISTS strategy_trades (
     runner_name TEXT,
     kickoff_at TIMESTAMP WITH TIME ZONE,
     status TEXT NOT NULL DEFAULT 'scheduled' CHECK (status IN (
+        -- Common statuses
         'scheduled',
         'back_pending',
         'back_matched',
         'hedged',
         'settled',
         'cancelled',
-        'failed'
+        'failed',
+        'completed',
+        'skipped',
+        -- Goal-reactive specific statuses
+        'watching',
+        'goal_wait',
+        'live',
+        'stop_loss_wait',
+        'stop_loss_active'
     )),
     back_order_ref TEXT,
     back_price DECIMAL(10,4),
@@ -35,7 +48,19 @@ CREATE TABLE IF NOT EXISTS strategy_trades (
     margin DECIMAL(10,6),
     commission_paid DECIMAL(10,2),
     last_error TEXT,
-    metadata JSONB
+    metadata JSONB,
+    -- Extended columns for strategies
+    competition_name TEXT,
+    event_name TEXT,
+    back_stake DECIMAL(10,2),
+    back_price_snapshot DECIMAL(10,4),
+    total_stake DECIMAL(10,2),
+    realised_pnl DECIMAL(10,2),
+    settled_at TIMESTAMP WITH TIME ZONE,
+    back_placed_at TIMESTAMP WITH TIME ZONE,
+    lay_placed_at TIMESTAMP WITH TIME ZONE,
+    needs_check_at TIMESTAMP WITH TIME ZONE,
+    state_data JSONB DEFAULT '{}'::JSONB
 );
 
 CREATE TABLE IF NOT EXISTS strategy_trade_events (
@@ -46,19 +71,47 @@ CREATE TABLE IF NOT EXISTS strategy_trade_events (
     payload JSONB NOT NULL DEFAULT '{}'::JSONB
 );
 
+-- Event types for epl_under25:
+-- TRADE_CREATED, TRADE_REACTIVATED, TRADE_PRUNED, BACK_PLACED, BACK_FAILED,
+-- BACK_MATCHED, BACK_PARTIALLY_MATCHED, BACK_ASSUMED_MATCHED, BACK_CANCELLED,
+-- MISSED_WINDOW
+
+-- Event types for epl_under25_goalreact:
+-- TRADE_CREATED, WATCHING_STARTED, GOAL_DETECTED, GOAL_AFTER_CUTOFF,
+-- GOAL_DISALLOWED, PRICE_OUT_OF_RANGE, POSITION_ENTERED, ENTRY_FAILED,
+-- SECOND_GOAL_DETECTED, STOP_LOSS_BASELINE_SET, PROFIT_TARGET_HIT, STOP_LOSS_EXIT
+
 CREATE TABLE IF NOT EXISTS strategy_settings (
     strategy_key TEXT PRIMARY KEY,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     enabled BOOLEAN NOT NULL DEFAULT false,
     default_stake DECIMAL(10,2) NOT NULL DEFAULT 10,
-    min_back_price DECIMAL(10,4) NOT NULL DEFAULT 2.0,
-    lay_target_price DECIMAL(10,4) NOT NULL DEFAULT 1.9,
-    back_lead_minutes INTEGER NOT NULL DEFAULT 30,
     fixture_lookahead_days INTEGER NOT NULL DEFAULT 7,
     commission_rate DECIMAL(10,6) NOT NULL DEFAULT 0.02,
     extra JSONB NOT NULL DEFAULT '{}'::JSONB
 );
+
+-- Settings Structure:
+-- Common fields (top-level): enabled, default_stake, fixture_lookahead_days, commission_rate
+-- Strategy-specific fields (in extra JSONB):
+--
+-- For epl_under25:
+--   min_back_price: DECIMAL (default: 1.8)
+--   min_profit_pct: NUMERIC (default: 10) - used to compute lay target price
+--   back_lead_minutes: INTEGER (default: 30)
+--   lay_ticks_below_back: INTEGER (default: 2)
+--   lay_persistence: TEXT (default: 'PERSIST')
+--
+-- For epl_under25_goalreact:
+--   min_entry_price: DECIMAL (default: 2.5)
+--   max_entry_price: DECIMAL (default: 5.0)
+--   wait_after_goal_seconds: INTEGER (default: 90)
+--   goal_cutoff_minutes: INTEGER (default: 45)
+--   goal_detection_pct: NUMERIC (default: 30)
+--   profit_target_pct: NUMERIC (default: 10)
+--   stop_loss_pct: NUMERIC (default: 15)
+--   in_play_poll_interval_seconds: INTEGER (default: 30)
 
 CREATE TABLE IF NOT EXISTS strategy_fixtures (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
