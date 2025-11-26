@@ -473,22 +473,29 @@ function TradeLogsPanel({ tradeId }: { tradeId: string }) {
         Event Log
       </div>
       <div className="space-y-1">
-        {events.map((event) => (
-          <div
-            key={event.id}
-            className="flex items-start gap-3 text-xs bg-[var(--color-card)]/40 rounded px-3 py-2"
-          >
-            <span className="text-[var(--color-text-muted)] whitespace-nowrap">
-              {formatDateTime(event.occurred_at)}
-            </span>
-            <span className="font-mono font-medium text-[var(--color-accent)]">
-              {event.event_type}
-            </span>
-            <span className="text-[var(--color-text-secondary)] truncate flex-1">
-              {formatEventPayload(event.payload)}
-            </span>
-          </div>
-        ))}
+        {events.map((event) => {
+          // Use payload timestamp if available (more accurate), fallback to occurred_at
+          const displayTime = event.payload?.timestamp 
+            ? String(event.payload.timestamp)
+            : event.occurred_at;
+          
+          return (
+            <div
+              key={event.id}
+              className="flex items-start gap-3 text-xs bg-[var(--color-card)]/40 rounded px-3 py-2"
+            >
+              <span className="text-[var(--color-text-muted)] whitespace-nowrap">
+                {formatDateTime(displayTime)}
+              </span>
+              <span className="font-mono font-medium text-[var(--color-accent)]">
+                {event.event_type}
+              </span>
+              <span className="text-[var(--color-text-secondary)] truncate flex-1">
+                {formatEventPayload(event.payload)}
+              </span>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -500,16 +507,45 @@ function formatEventPayload(payload: Record<string, unknown>): string {
   // Extract key fields for display
   const parts: string[] = [];
   
+  // --- Pre-match hedge fields ---
   if (payload.price) parts.push(`price: ${payload.price}`);
   if (payload.stake) parts.push(`stake: ${payload.stake}`);
-  if (payload.entry_price) parts.push(`entry: ${payload.entry_price}`);
-  if (payload.exit_price) parts.push(`exit: ${payload.exit_price}`);
-  if (payload.spike_price) parts.push(`spike: ${payload.spike_price}`);
+  if (payload.lay_price) parts.push(`lay_price: ${payload.lay_price}`);
+  if (payload.lay_stake) parts.push(`lay_stake: ${payload.lay_stake}`);
+  if (payload.matched_price) parts.push(`matched: ${payload.matched_price}`);
+  if (payload.matched_size) parts.push(`size: ${payload.matched_size}`);
+  if (payload.persistence) parts.push(`persist: ${payload.persistence}`);
+  if (payload.realised_pnl !== undefined) {
+    const pnl = Number(payload.realised_pnl);
+    parts.push(`P&L: ${pnl >= 0 ? '+' : ''}£${pnl.toFixed(2)}`);
+  }
+  if (payload.outcome) parts.push(`outcome: ${payload.outcome}`);
+  
+  // --- Goal reactive fields ---
+  if (payload.price_after_goal) parts.push(`price_after_goal: ${payload.price_after_goal}`);
+  if (payload.price_entered) parts.push(`price_entered: ${payload.price_entered}`);
+  if (payload.price_exited) parts.push(`price_exited: ${payload.price_exited}`);
+  if (payload.entry_price && !payload.price_entered) parts.push(`entry: ${payload.entry_price}`);
+  if (payload.exit_price && !payload.price_exited) parts.push(`exit: ${payload.exit_price}`);
+  if (payload.spike_price && !payload.price_after_goal) parts.push(`spike: ${payload.spike_price}`);
   if (payload.baseline_price) parts.push(`baseline: ${payload.baseline_price}`);
+  if (payload.stop_loss_baseline) parts.push(`SL_baseline: ${payload.stop_loss_baseline}`);
+  if (payload.goal_number) parts.push(`goal: #${payload.goal_number}`);
+  
+  // --- Percentage fields ---
   if (payload.price_change_pct) parts.push(`change: ${Number(payload.price_change_pct).toFixed(1)}%`);
   if (payload.profit_pct) parts.push(`profit: ${Number(payload.profit_pct).toFixed(1)}%`);
-  if (payload.mins_from_kickoff) parts.push(`min: ${Number(payload.mins_from_kickoff).toFixed(0)}`);
-  if (payload.bet_id) parts.push(`betId: ${String(payload.bet_id).slice(0, 8)}...`);
+  if (payload.drop_pct) parts.push(`drop: ${Number(payload.drop_pct).toFixed(1)}%`);
+  if (payload.stop_loss_pct) parts.push(`SL_target: ${payload.stop_loss_pct}%`);
+  
+  // --- Time/context fields ---
+  if (payload.mins_from_kickoff !== undefined) parts.push(`min: ${Number(payload.mins_from_kickoff).toFixed(0)}`);
+  
+  // --- Bet ID (handle both cases) ---
+  const betId = payload.betId || payload.bet_id || payload.lay_bet_id;
+  if (betId) parts.push(`betId: ${String(betId).slice(0, 8)}...`);
+  
+  // --- Error/status fields ---
   if (payload.errorCode) parts.push(`error: ${payload.errorCode}`);
   if (payload.reason) parts.push(`reason: ${payload.reason}`);
   

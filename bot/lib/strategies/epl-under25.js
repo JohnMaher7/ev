@@ -1067,21 +1067,32 @@ class EplUnder25Strategy {
     if (phase === 'INITIAL') {
       if (!book || !book.inplay) return; // Wait for in-play
 
-      const targetPrice = computeTargetLayPrice(trade.back_price, this.settings);
-      const { layStake } = this.calculateHedgeStakeFromBook(book, market.selectionId, trade, targetPrice);
+      // Check if lay order was already placed (new pre-match strategy)
+      if (trade.lay_order_ref) {
+        this.logger.log(`[strategy:epl_under25] Lay order already exists (${trade.lay_order_ref}) - skipping INITIAL, entering MONITORING`);
+        state.phase = 'MONITORING';
+        state.profit_order_id = trade.lay_order_ref;
+        state.last_stable_price = trade.back_price;
+        state.lay_snapshot = { stake: trade.lay_size, price: trade.lay_price };
+        updatedState = true;
+      } else {
+        // Legacy fallback: place lay order now if not already placed
+        const targetPrice = computeTargetLayPrice(trade.back_price, this.settings);
+        const { layStake } = this.calculateHedgeStakeFromBook(book, market.selectionId, trade, targetPrice);
 
-      if (layStake > 0) {
-        const placeRes = await this.placeLimitLaySafe(market.marketId, market.selectionId, layStake, targetPrice, sessionToken, 'phase1-place');
-        if (placeRes.status === 'SUCCESS') {
-          state.phase = 'MONITORING';
-          state.profit_order_id = placeRes.betId;
-          state.last_stable_price = trade.back_price;
-          state.lay_snapshot = { stake: layStake, price: targetPrice };
-          await this.recordLaySnapshot(trade, { layStake, layPrice: targetPrice, betId: placeRes.betId });
-          updatedState = true;
-          this.logger.log(`[strategy:epl_under25] Phase 1 Complete: Placed Profit Lay @ ${targetPrice} (ID: ${placeRes.betId})`);
-        } else {
-          this.logger.warn(`[strategy:epl_under25] Phase 1 Failed: ${placeRes.errorCode}`);
+        if (layStake > 0) {
+          const placeRes = await this.placeLimitLaySafe(market.marketId, market.selectionId, layStake, targetPrice, sessionToken, 'phase1-place');
+          if (placeRes.status === 'SUCCESS') {
+            state.phase = 'MONITORING';
+            state.profit_order_id = placeRes.betId;
+            state.last_stable_price = trade.back_price;
+            state.lay_snapshot = { stake: layStake, price: targetPrice };
+            await this.recordLaySnapshot(trade, { layStake, layPrice: targetPrice, betId: placeRes.betId });
+            updatedState = true;
+            this.logger.log(`[strategy:epl_under25] Phase 1 Complete: Placed Profit Lay @ ${targetPrice} (ID: ${placeRes.betId})`);
+          } else {
+            this.logger.warn(`[strategy:epl_under25] Phase 1 Failed: ${placeRes.errorCode}`);
+          }
         }
       }
     }
@@ -1091,6 +1102,15 @@ class EplUnder25Strategy {
       // Check Profit Order Status
       const orderStatus = await this.getOrderStatusSafe(state.profit_order_id, sessionToken, 'phase2-status');
       if (orderStatus === 'EXECUTION_COMPLETE') {
+        // Lay order matched - log with timestamp
+        const layMatchedAt = new Date().toISOString();
+        await this.logEvent(trade.id, 'LAY_MATCHED', {
+          betId: state.profit_order_id,
+          lay_price: state.lay_snapshot?.price || trade.lay_price,
+          lay_stake: state.lay_snapshot?.stake || trade.lay_size,
+          timestamp: layMatchedAt,
+        });
+        
         state.phase = 'COMPLETED';
         await this.settleTradeWithPnl(trade, state);
         this.logger.log(`[strategy:epl_under25] Trade Completed: Profit Target Reached`);
@@ -1216,6 +1236,16 @@ class EplUnder25Strategy {
       const orderStatus = await this.getOrderStatusSafe(state.recovery_order_id, sessionToken, 'phase4-status');
       
       if (orderStatus === 'EXECUTION_COMPLETE') {
+        // Recovery lay order matched - log with timestamp
+        const recoveryLayMatchedAt = new Date().toISOString();
+        await this.logEvent(trade.id, 'LAY_MATCHED', {
+          betId: state.recovery_order_id,
+          lay_price: state.recovery_target_price || trade.lay_price,
+          lay_stake: trade.lay_size || trade.lay_matched_size,
+          recovery_order: true,
+          timestamp: recoveryLayMatchedAt,
+        });
+        
         this.logger.log('[strategy:epl_under25] Recovery order matched - Drift Target Reached');
         state.phase = 'COMPLETED';
         await this.settleTradeWithPnl(trade, state, {
@@ -1367,6 +1397,14 @@ class EplUnder25Strategy {
           }
         }
 
+        // Build state_data for state machine - skip INITIAL phase since lay is already placed
+        const stateData = layPlaced ? {
+          phase: 'MONITORING',
+          profit_order_id: layBetId,
+          last_stable_price: bestLayPrice,
+          lay_snapshot: { stake: layStake, price: layTargetPrice },
+        } : { phase: 'INITIAL' };
+
         await this.updateTrade(trade.id, {
             status: 'back_pending',  // Not matched yet - will check at kickoff
             back_price: bestLayPrice,
@@ -1384,6 +1422,8 @@ class EplUnder25Strategy {
             lay_price: layPlaced ? layTargetPrice : null,
             lay_size: layPlaced ? layStake : null,
             lay_placed_at: layPlaced ? new Date().toISOString() : null,
+            // State machine - enter MONITORING if lay placed, otherwise INITIAL
+            state_data: stateData,
         });
 
         trade.back_price = bestLayPrice;
@@ -1400,13 +1440,25 @@ class EplUnder25Strategy {
           trade.lay_size = layStake;
         }
 
+        const backPlacedAt = new Date().toISOString();
         await this.logEvent(trade.id, 'BACK_PLACED', { 
           price: bestLayPrice, 
           stake, 
           betId: report.betId, 
           backPrice: bestBackPrice,
-          layOrder: layPlaced ? { price: layTargetPrice, stake: layStake, betId: layBetId, persistence: layPersistence } : null,
+          timestamp: backPlacedAt,
         });
+        
+        if (layPlaced) {
+          const layPlacedAt = new Date().toISOString();
+          await this.logEvent(trade.id, 'LAY_PLACED', {
+            price: layTargetPrice,
+            stake: layStake,
+            betId: layBetId,
+            persistence: layPersistence,
+            timestamp: layPlacedAt,
+          });
+        }
         } else {
         this.logger.error(`[strategy:epl_under25] Failed to place BACK order: ${report?.errorCode}`);
         await this.logEvent(trade.id, 'BACK_FAILED', { errorCode: report?.errorCode });
@@ -1471,7 +1523,12 @@ class EplUnder25Strategy {
             trade.back_price = order.averagePriceMatched || order.price;
             trade.back_stake = matchedStake;
             trade.total_stake = matchedStake + (trade.lay_size || 0);
-            await this.logEvent(trade.id, 'BACK_MATCHED', { order });
+            await this.logEvent(trade.id, 'BACK_MATCHED', { 
+              order,
+              matched_price: order.averagePriceMatched || order.price,
+              matched_size: order.sizeMatched,
+              timestamp: new Date().toISOString(),
+            });
             return;
         }
 
@@ -1631,6 +1688,22 @@ class EplUnder25Strategy {
     };
 
     await this.updateTrade(trade.id, patch);
+
+    // Log clear profit/loss outcome
+    const outcomeSymbol = realised >= 0 ? '✓ PROFIT' : '✗ LOSS';
+    const eventName = trade.event_name || trade.fixture_name || trade.event_id || 'Unknown';
+    this.logger.log(`[strategy:epl_under25] ${outcomeSymbol}: £${realised.toFixed(2)} on ${eventName}`);
+    this.logger.log(`[strategy:epl_under25]   Back: £${backStake.toFixed(2)} @ ${backPrice} | Lay: £${layStake.toFixed(2)} @ ${layPrice}`);
+
+    await this.logEvent(trade.id, 'TRADE_SETTLED', {
+      realised_pnl: realised,
+      back_stake: backStake,
+      back_price: backPrice,
+      lay_stake: layStake,
+      lay_price: layPrice,
+      commission,
+      outcome: realised >= 0 ? 'profit' : 'loss',
+    });
 
     trade.status = 'hedged';
     trade.lay_matched_size = layStake;

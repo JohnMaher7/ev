@@ -187,14 +187,15 @@ class EplUnder25GoalReactStrategy {
       const kickoff = new Date(upcomingGames[0].kickoff_at).getTime();
       const delay = kickoff - now;
       
-      // Wake up at kickoff (or within 1 minute)
-      if (delay <= 60000) {
-        this.logger.log(`[strategy:${STRATEGY_KEY}] Game starting NOW - begin watching`);
+      // Wake up at kickoff time (delay <= 0 means game has started or starting now)
+      if (delay <= 0) {
+        this.logger.log(`[strategy:${STRATEGY_KEY}] Game KICKOFF - begin watching for goals`);
         return 0;
       }
       
+      // Sleep until kickoff, capped between 1 minute and 24 hours
       const cappedDelay = Math.max(60 * 1000, Math.min(delay, 24 * 60 * 60 * 1000));
-      this.logger.log(`[strategy:${STRATEGY_KEY}] Next kickoff in ${(cappedDelay / 60000).toFixed(1)} min`);
+      this.logger.log(`[strategy:${STRATEGY_KEY}] Next kickoff in ${(cappedDelay / 60000).toFixed(1)} min - sleeping until then`);
       return cappedDelay;
     }
     
@@ -445,7 +446,7 @@ class EplUnder25GoalReactStrategy {
       if (error) throw error;
 
       if (!trades || trades.length === 0) {
-        this.logger.log(`[strategy:${STRATEGY_KEY}] No active trades - stopping polling`);
+        this.logger.log(`[strategy:${STRATEGY_KEY}] No trades in database - stopping polling`);
         this.stopActivePolling();
         setImmediate(() => this.smartSchedulerLoop());
         return;
@@ -453,6 +454,7 @@ class EplUnder25GoalReactStrategy {
 
       const now = new Date();
       let activeCount = 0;
+      let pendingCount = 0;  // Games not yet started
 
       for (const trade of trades) {
         try {
@@ -461,8 +463,11 @@ class EplUnder25GoalReactStrategy {
 
           const minsFromKickoff = (now.getTime() - kickoff.getTime()) / 60000;
 
-          // Skip games not yet started
-          if (minsFromKickoff < 0) continue;
+          // Track games not yet started
+          if (minsFromKickoff < 0) {
+            pendingCount++;
+            continue;
+          }
 
           // Skip games that are too old (> 120 mins from kickoff = game over)
           if (minsFromKickoff > 120) {
@@ -480,12 +485,30 @@ class EplUnder25GoalReactStrategy {
         }
       }
 
-      this.logger.log(`[strategy:${STRATEGY_KEY}] <<< Processed ${activeCount} active trades`);
+      this.logger.log(`[strategy:${STRATEGY_KEY}] <<< Processed ${activeCount} active trades (${pendingCount} pending kickoff)`);
 
-      // If no active trades, trigger scheduler recalculation
+      // If no active trades, check if games are starting soon before stopping polling
       if (activeCount === 0) {
-        this.stopActivePolling();
-        setImmediate(() => this.smartSchedulerLoop());
+        // Check for scheduled games within next 10 minutes
+        const tenMinutesFromNow = new Date(now.getTime() + 10 * 60 * 1000);
+        const { data: upcomingGames } = await this.supabase
+          .from('strategy_trades')
+          .select('kickoff_at, event_id')
+          .eq('strategy_key', STRATEGY_KEY)
+          .eq('status', 'scheduled')
+          .lte('kickoff_at', tenMinutesFromNow.toISOString())
+          .gt('kickoff_at', new Date(now.getTime() - 5 * 60 * 1000).toISOString())  // Not more than 5 mins in past
+          .limit(1);
+
+        if (upcomingGames?.length > 0) {
+          // Games starting soon - keep polling active
+          this.logger.log(`[strategy:${STRATEGY_KEY}] No active trades but games starting soon - keeping polling active`);
+        } else {
+          // No games starting soon - safe to stop polling
+          this.logger.log(`[strategy:${STRATEGY_KEY}] No active trades and no games starting soon - stopping polling`);
+          this.stopActivePolling();
+          setImmediate(() => this.smartSchedulerLoop());
+        }
       }
 
     } catch (err) {
@@ -546,10 +569,14 @@ class EplUnder25GoalReactStrategy {
     const goalCutoff = this.settings?.goal_cutoff_minutes || this.defaults.goal_cutoff_minutes;
     const goalDetectionPct = this.settings?.goal_detection_pct || this.defaults.goal_detection_pct;
 
-    // Initialize baseline if not set
+    // Initialize baseline if not set - this is the transition from scheduled → watching
     if (!state.baseline_price) {
       state.baseline_price = backPrice;
       state.last_price = backPrice;
+      
+      const eventName = trade.event_name || trade.event_id || 'Unknown';
+      this.logger.log(`[strategy:${STRATEGY_KEY}] 👀 WATCHING STARTED: ${eventName} (baseline: ${backPrice}, min: ${minsFromKickoff.toFixed(0)})`);
+      
       await this.updateTrade(trade.id, { 
         status: 'watching',
         state_data: state 
@@ -597,13 +624,15 @@ class EplUnder25GoalReactStrategy {
         status: 'goal_wait',
         state_data: state,
       });
+      const goalDetectedAt = new Date().toISOString();
       await this.logEvent(trade.id, 'GOAL_DETECTED', { 
         goal_number: 1,
+        price_after_goal: backPrice,
         spike_price: backPrice,
         baseline_price: state.baseline_price,
         price_change_pct: priceChange,
         mins_from_kickoff: minsFromKickoff,
-        timestamp: new Date().toISOString(),
+        timestamp: goalDetectedAt,
       });
       return;
     }
@@ -706,13 +735,15 @@ class EplUnder25GoalReactStrategy {
         betfair_market_id: market.marketId,
         selection_id: market.selectionId,
       });
+      const positionEnteredAt = new Date().toISOString();
       await this.logEvent(trade.id, 'POSITION_ENTERED', { 
+        price_entered: entryPrice,
         entry_price: entryPrice,
         stake,
         back_price: backPrice,
         lay_price: layPrice,
         bet_id: placeRes.betId,
-        timestamp: new Date().toISOString(),
+        timestamp: positionEnteredAt,
       });
     } else {
       this.logger.error(`[strategy:${STRATEGY_KEY}] Entry failed: ${placeRes.errorCode}`);
@@ -756,13 +787,16 @@ class EplUnder25GoalReactStrategy {
         state.exit_time = Date.now();
         state.exit_reason = 'PROFIT_TARGET';
         
+        const exitAt = new Date().toISOString();
         await this.settleTradeWithPnl(trade, state, 'WIN', { layPrice: backPrice, layStake });
         await this.logEvent(trade.id, 'PROFIT_TARGET_HIT', { 
+          price_entered: entryPrice,
+          price_exited: backPrice,
           entry_price: entryPrice,
           exit_price: backPrice,
           profit_pct: priceDropPct,
           lay_bet_id: layRes.betId,
-          timestamp: new Date().toISOString(),
+          timestamp: exitAt,
         });
       }
       return;
@@ -859,14 +893,18 @@ class EplUnder25GoalReactStrategy {
         state.exit_time = Date.now();
         state.exit_reason = 'STOP_LOSS';
         
+        const stopLossExitAt = new Date().toISOString();
         await this.settleTradeWithPnl(trade, state, 'STOP_LOSS', { layPrice: backPrice, layStake });
         await this.logEvent(trade.id, 'STOP_LOSS_EXIT', { 
+          price_entered: state.entry_price,
+          price_exited: backPrice,
           entry_price: state.entry_price,
           exit_price: backPrice,
-          baseline: baseline,
+          stop_loss_baseline: baseline,
           drop_pct: dropFromBaseline,
+          stop_loss_pct: stopLossPct,
           lay_bet_id: layRes.betId,
-          timestamp: new Date().toISOString(),
+          timestamp: stopLossExitAt,
         });
       }
       return;
