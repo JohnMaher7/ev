@@ -175,43 +175,18 @@ class EplUnder25Strategy {
   async calculateNextWakeTime() {
     const now = Date.now();
     
-    // Priority 1: Check for active in-play trades that need monitoring (5s polling)
+    // Priority 1: Check for active trades that need monitoring
+    // INCLUDES back_pending - we poll these to detect pre-match matches and place lay immediately
     const { data: activeTrades } = await this.supabase
       .from('strategy_trades')
       .select('id, status')
       .eq('strategy_key', STRATEGY_KEY)
-      .in('status', ['back_matched', 'hedge_pending'])  // Removed 'back_pending' - those sleep until kickoff
+      .in('status', ['back_pending', 'back_matched', 'hedge_pending'])
       .limit(1);
     
     if (activeTrades?.length > 0) {
-      this.logger.log(`[strategy:epl_under25] Active trades detected (${activeTrades[0].status}) - need immediate attention`);
-      return 0; // Wake now - active trades need 5s polling
-    }
-    
-    // Priority 2: Check for back_pending orders that need verification at kickoff
-    const { data: pendingOrders } = await this.supabase
-      .from('strategy_trades')
-      .select('needs_check_at, event_id, id')
-      .eq('strategy_key', STRATEGY_KEY)
-      .eq('status', 'back_pending')
-      .not('needs_check_at', 'is', null)
-      .order('needs_check_at', { ascending: true })
-      .limit(1);
-    
-    if (pendingOrders?.length > 0) {
-      const checkTime = new Date(pendingOrders[0].needs_check_at).getTime();
-      const delay = checkTime - now;
-      
-      // Check if order needs verification NOW (at or past kickoff time)
-      if (delay <= 60000) {  // Within 1 minute of kickoff (allows for clock drift)
-        this.logger.log(`[strategy:epl_under25] ⚠️ PENDING ORDER NEEDS VERIFICATION NOW (kickoff reached)`);
-        return 0; // Check now - trigger processActiveTrades
-      }
-      
-      // Wake up at kickoff to verify if order matched
-      const cappedDelay = Math.max(60 * 1000, Math.min(delay, 24 * 60 * 60 * 1000));
-      this.logger.log(`[strategy:epl_under25] Pending order check at kickoff (wake in ${(cappedDelay/60000).toFixed(1)} min)`);
-      return cappedDelay;
+      this.logger.log(`[strategy:epl_under25] Active trades detected (${activeTrades[0].status}) - need polling`);
+      return 0; // Wake now - active trades need polling
     }
     
     // Priority 3: Check for scheduled trades approaching kickoff
@@ -286,7 +261,8 @@ class EplUnder25Strategy {
         // IMPORTANT: Recalculate next wake time instead of blindly checking every 30s
         // After placing bets, we should sleep until kickoff (when back_pending orders need checking)
         // This prevents wasting resources polling games outside the window
-        this.smartSchedulerTimer = setTimeout(() => this.smartSchedulerLoop(), 5000);
+        // Changed from 5s to 1 minute to reduce API calls when trade window is open
+        this.smartSchedulerTimer = setTimeout(() => this.smartSchedulerLoop(), 60 * 1000);
         
       } else {
         // More than 5 minutes away - go to sleep
@@ -390,6 +366,155 @@ class EplUnder25Strategy {
       return order?.status;
     } catch (err) {
       return null;
+    }
+  }
+
+  /**
+   * Get full order details including matched/remaining sizes
+   * CRITICAL: Use this to verify actual matched amounts before settling
+   */
+  async getOrderDetailsSafe(betId, sessionToken, label) {
+    if (!betId) return null;
+    try {
+      const res = await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/listCurrentOrders', {
+        betIds: [betId],
+        orderProjection: 'ALL',
+      }, label);
+      const order = res?.currentOrders?.[0];
+      if (!order) {
+        // Order not in current orders - might be cleared/cancelled
+        return null;
+      }
+      return {
+        status: order.status,
+        sizeMatched: order.sizeMatched || 0,
+        sizeRemaining: order.sizeRemaining || 0,
+        averagePriceMatched: order.averagePriceMatched || order.price,
+        betId: order.betId,
+        side: order.side,
+        price: order.price,
+      };
+    } catch (err) {
+      this.logger.error(`[strategy:epl_under25] getOrderDetailsSafe error: ${err.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Handle lay order cancelled/failed - decide next action based on current price
+   * - If no goal detected (price stable): Re-place profit target lay
+   * - If goal detected (30% spike): Move to EVENT_WAIT/RECOVERY phase
+   */
+  async placeEmergencyHedge(trade, sessionToken, market, state) {
+    const backMatched = trade.back_matched_size || trade.back_size || 0;
+    const backPrice = trade.back_price;
+    
+    if (backMatched <= 0) {
+      this.logger.log(`[strategy:epl_under25] No back exposure - no action needed`);
+      return;
+    }
+    
+    const book = await this.getMarketBookSafe(market.marketId, sessionToken, 'rehedge-book');
+    const runner = book?.runners?.find(r => r.selectionId == market.selectionId);
+    const currentBackPrice = runner?.ex?.availableToBack?.[0]?.price;
+    const currentLayPrice = runner?.ex?.availableToLay?.[0]?.price;
+    
+    if (!currentBackPrice || !currentLayPrice) {
+      this.logger.error(`[strategy:epl_under25] ❌ No prices available - POSITION EXPOSED`);
+      await this.updateTrade(trade.id, {
+        last_error: 'REHEDGE_FAILED_NO_PRICE',
+        state_data: { ...state, rehedge_failed: true, failed_at: new Date().toISOString() },
+      });
+      await this.logEvent(trade.id, 'REHEDGE_FAILED', {
+        reason: 'NO_PRICES',
+        back_exposure: backMatched,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+    
+    // Check if this looks like a goal (30% price spike from stable price)
+    const stablePrice = state.last_stable_price || backPrice;
+    const priceChangePct = ((currentBackPrice - stablePrice) / stablePrice) * 100;
+    const goalThreshold = 30; // 30% spike = likely goal
+    
+    this.logger.log(`[strategy:epl_under25] Lay order cancelled - checking situation: current=${currentBackPrice}, stable=${stablePrice}, change=${priceChangePct.toFixed(1)}%`);
+    
+    if (priceChangePct >= goalThreshold) {
+      // GOAL DETECTED - Move to EVENT_WAIT phase (same as normal goal detection)
+      this.logger.log(`[strategy:epl_under25] 🎯 GOAL DETECTED during suspension (${priceChangePct.toFixed(1)}% spike) - moving to EVENT_WAIT`);
+      
+      state.phase = 'EVENT_WAIT';
+      state.spike_start_ts = Date.now();
+      state.peak_price = currentBackPrice;
+      state.lay_cancelled_during_goal = true;
+      
+      await this.updateTrade(trade.id, {
+        state_data: state,
+        last_error: null,
+      });
+      
+      await this.logEvent(trade.id, 'GOAL_DETECTED_LAY_CANCELLED', {
+        price_change_pct: priceChangePct,
+        current_price: currentBackPrice,
+        stable_price: stablePrice,
+        action: 'MOVING_TO_EVENT_WAIT',
+        timestamp: new Date().toISOString(),
+      });
+      
+      // Will be handled by EVENT_WAIT phase on next tick
+      return;
+    }
+    
+    // NO GOAL - Price is stable, re-place original profit target lay
+    this.logger.log(`[strategy:epl_under25] Price stable (${priceChangePct.toFixed(1)}% change) - re-placing profit target lay`);
+    
+    const targetPrice = computeTargetLayPrice(backPrice, this.settings);
+    const { layStake } = this.calculateHedgeStakeFromBook(book, market.selectionId, trade, targetPrice);
+    
+    if (layStake <= 0) {
+      this.logger.error(`[strategy:epl_under25] Invalid lay stake calculated: ${layStake}`);
+      return;
+    }
+    
+    const placeRes = await this.placeLimitLaySafe(market.marketId, market.selectionId, layStake, targetPrice, sessionToken, 'replace-profit-lay');
+    
+    if (placeRes.status === 'SUCCESS') {
+      this.logger.log(`[strategy:epl_under25] ✓ Profit lay RE-PLACED @ ${targetPrice} (betId: ${placeRes.betId})`);
+      
+      // Continue in MONITORING phase with new order
+      state.phase = 'MONITORING';
+      state.profit_order_id = placeRes.betId;
+      state.lay_snapshot = { stake: layStake, price: targetPrice };
+      state.lay_replaced = true;
+      
+      await this.updateTrade(trade.id, {
+        lay_order_ref: placeRes.betId,
+        lay_price: targetPrice,
+        lay_size: layStake,
+        lay_placed_at: new Date().toISOString(),
+        state_data: state,
+        last_error: null,
+      });
+      
+      await this.logEvent(trade.id, 'LAY_REPLACED', {
+        betId: placeRes.betId,
+        lay_price: targetPrice,
+        lay_stake: layStake,
+        reason: 'ORIGINAL_CANCELLED_NO_GOAL',
+        timestamp: new Date().toISOString(),
+      });
+    } else {
+      this.logger.error(`[strategy:epl_under25] ❌ Re-place profit lay FAILED: ${placeRes.errorCode}`);
+      await this.updateTrade(trade.id, {
+        last_error: `LAY_REPLACE_FAILED: ${placeRes.errorCode}`,
+        state_data: { ...state, lay_replace_failed: true },
+      });
+      await this.logEvent(trade.id, 'LAY_REPLACE_FAILED', {
+        errorCode: placeRes.errorCode,
+        back_exposure: backMatched,
+        timestamp: new Date().toISOString(),
+      });
     }
   }
 
@@ -610,6 +735,7 @@ class EplUnder25Strategy {
             else if (id === '117') competitionIdToName.set(id, 'Spanish La Liga');
             else if (id === '81') competitionIdToName.set(id, 'Italian Serie A');
             else if (id === '228') competitionIdToName.set(id, 'UEFA Champions League');
+            else if (id === '2005') competitionIdToName.set(id, 'UEFA Europa League');
           }
         });
       }
@@ -1099,21 +1225,68 @@ class EplUnder25Strategy {
 
     // --- PHASE 2: MONITORING LOOP ---
     else if (phase === 'MONITORING') {
-      // Check Profit Order Status
-      const orderStatus = await this.getOrderStatusSafe(state.profit_order_id, sessionToken, 'phase2-status');
-      if (orderStatus === 'EXECUTION_COMPLETE') {
-        // Lay order matched - log with timestamp
+      // CRITICAL FIX: Verify ACTUAL matched size, not just status
+      // Status can be misleading - order might be cancelled/lapsed due to suspension
+      const orderDetails = await this.getOrderDetailsSafe(state.profit_order_id, sessionToken, 'phase2-verify');
+      
+      if (!orderDetails) {
+        // Order not found - might be cancelled due to suspension
+        this.logger.warn(`[strategy:epl_under25] ⚠️ Lay order ${state.profit_order_id} NOT FOUND - checking if suspended/cancelled`);
+        
+        // Check if we have exposure and need to re-hedge
+        const backMatched = trade.back_matched_size || trade.back_size || 0;
+        if (backMatched > 0) {
+          this.logger.warn(`[strategy:epl_under25] ⚠️ EXPOSED: Back £${backMatched} matched but lay order disappeared - PLACING EMERGENCY HEDGE`);
+          await this.placeEmergencyHedge(trade, sessionToken, market, state);
+        }
+        return;
+      }
+      
+      // Check if order was cancelled/lapsed (e.g., due to market suspension)
+      if (orderDetails.status !== 'EXECUTABLE' && orderDetails.status !== 'EXECUTION_COMPLETE') {
+        this.logger.warn(`[strategy:epl_under25] ⚠️ Lay order status: ${orderDetails.status} (matched: £${orderDetails.sizeMatched}) - order may have been cancelled`);
+        
+        if (orderDetails.sizeMatched > 0) {
+          // Partially matched before cancellation - settle with what matched
+          this.logger.log(`[strategy:epl_under25] Lay partially matched £${orderDetails.sizeMatched} before cancellation`);
+          await this.settleTradeWithPnl(trade, state, {
+            layStakeOverride: orderDetails.sizeMatched,
+            layPriceOverride: orderDetails.averagePriceMatched || trade.lay_price,
+          });
+        } else {
+          // No lay matched - trade is exposed, need emergency hedge
+          this.logger.warn(`[strategy:epl_under25] ⚠️ Lay order cancelled with no match - PLACING EMERGENCY HEDGE`);
+          await this.placeEmergencyHedge(trade, sessionToken, market, state);
+        }
+        return;
+      }
+      
+      if (orderDetails.status === 'EXECUTION_COMPLETE' || (orderDetails.sizeMatched > 0 && orderDetails.sizeRemaining === 0)) {
+        // Verify actual matched size before celebrating
+        const actualMatchedSize = orderDetails.sizeMatched || 0;
+        const expectedSize = state.lay_snapshot?.stake || trade.lay_size || 0;
+        
+        if (actualMatchedSize < expectedSize * 0.99) {
+          // Less than expected matched - partial fill
+          this.logger.warn(`[strategy:epl_under25] ⚠️ Lay only partially matched: £${actualMatchedSize} of £${expectedSize}`);
+        }
+        
+        // Lay order genuinely matched
         const layMatchedAt = new Date().toISOString();
         await this.logEvent(trade.id, 'LAY_MATCHED', {
           betId: state.profit_order_id,
-          lay_price: state.lay_snapshot?.price || trade.lay_price,
-          lay_stake: state.lay_snapshot?.stake || trade.lay_size,
+          lay_price: orderDetails.averagePriceMatched || state.lay_snapshot?.price || trade.lay_price,
+          lay_stake: actualMatchedSize,
+          expected_stake: expectedSize,
           timestamp: layMatchedAt,
         });
         
         state.phase = 'COMPLETED';
-        await this.settleTradeWithPnl(trade, state);
-        this.logger.log(`[strategy:epl_under25] Trade Completed: Profit Target Reached`);
+        await this.settleTradeWithPnl(trade, state, {
+          layStakeOverride: actualMatchedSize,
+          layPriceOverride: orderDetails.averagePriceMatched || trade.lay_price,
+        });
+        this.logger.log(`[strategy:epl_under25] Trade Completed: Profit Target Reached (matched £${actualMatchedSize})`);
         
         // Trigger smart scheduler to recalculate (trade completed)
         if (process.env.EPL_UNDER25_SCHEDULER_MODE === 'smart' || !process.env.EPL_UNDER25_SCHEDULER_MODE) {
@@ -1322,7 +1495,18 @@ class EplUnder25Strategy {
 
     const minPrice = this.settings.min_back_price || this.defaults.min_back_price;
     if (bestLayPrice < minPrice) {
-      this.logger.log(`[strategy:epl_under25] Lay price ${bestLayPrice} too low (min: ${minPrice}) for ${trade.fixture_name}`);
+      this.logger.log(`[strategy:epl_under25] Lay price ${bestLayPrice} too low (min: ${minPrice}) for ${trade.fixture_name} - cancelling trade to stop polling`);
+      // Mark trade as cancelled to stop polling this match (saves API calls)
+      await this.updateTrade(trade.id, {
+        status: 'cancelled',
+        last_error: `LAY_PRICE_TOO_LOW: ${bestLayPrice} < ${minPrice}`,
+      });
+      await this.logEvent(trade.id, 'TRADE_CANCELLED', {
+        reason: 'LAY_PRICE_TOO_LOW',
+        lay_price: bestLayPrice,
+        min_price: minPrice,
+        timestamp: new Date().toISOString(),
+      });
       return;
     }
 
@@ -1351,60 +1535,9 @@ class EplUnder25Strategy {
         const report = placeRes?.instructionReports?.[0];
         if (report && report.status === 'SUCCESS') {
         this.logger.log(`[strategy:epl_under25] Placed BACK order @ LAY PRICE ${bestLayPrice} for ${trade.fixture_name} (back was ${bestBackPrice}, spread saved)`);
+        this.logger.log(`[strategy:epl_under25] Back order will be checked at kickoff. Lay will be placed after back matches.`);
 
-        // STRATEGY 1: Immediately place lay order 2 ticks below back price (keep in-play)
-        const layTicksCount = this.settings.lay_ticks_below_back || this.defaults.lay_ticks_below_back || 2;
-        const layTargetPrice = ticksBelow(bestLayPrice, layTicksCount);
-        const layPersistence = this.settings.lay_persistence || this.defaults.lay_persistence || 'PERSIST';
-        
-        // Calculate lay stake for hedge
-        const { layStake } = calculateLayStake({
-          backStake: stake,
-          backPrice: bestLayPrice,
-          layPrice: layTargetPrice,
-          commission: this.settings.commission_rate || this.defaults.commission_rate,
-        });
-        
-        let layBetId = null;
-        let layPlaced = false;
-        
-        if (layStake > 0) {
-          const layCustomerRef = `LAY-${Date.now()}`;
-          const layRes = await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/placeOrders', {
-            marketId: market.marketId,
-            customerRef: layCustomerRef,
-            instructions: [
-              {
-                selectionId: market.selectionId,
-                side: 'LAY',
-                orderType: 'LIMIT',
-                limitOrder: {
-                  size: layStake,
-                  price: layTargetPrice,
-                  persistenceType: layPersistence,  // PERSIST = keep in-play
-                },
-              },
-            ],
-          }, 'placeLay-immediate');
-          
-          const layReport = layRes?.instructionReports?.[0];
-          if (layReport && layReport.status === 'SUCCESS') {
-            layBetId = layReport.betId;
-            layPlaced = true;
-            this.logger.log(`[strategy:epl_under25] ✓ Placed LAY order @ ${layTargetPrice} (${layTicksCount} ticks below back, persistence=${layPersistence}) - betId: ${layBetId}`);
-          } else {
-            this.logger.warn(`[strategy:epl_under25] ⚠️ LAY order failed: ${layReport?.errorCode || 'unknown'}`);
-          }
-        }
-
-        // Build state_data for state machine - skip INITIAL phase since lay is already placed
-        const stateData = layPlaced ? {
-          phase: 'MONITORING',
-          profit_order_id: layBetId,
-          last_stable_price: bestLayPrice,
-          lay_snapshot: { stake: layStake, price: layTargetPrice },
-        } : { phase: 'INITIAL' };
-
+        // Update trade - lay will be placed after back is confirmed matched at kickoff
         await this.updateTrade(trade.id, {
             status: 'back_pending',  // Not matched yet - will check at kickoff
             back_price: bestLayPrice,
@@ -1416,29 +1549,24 @@ class EplUnder25Strategy {
             selection_id: market.selectionId,
             back_placed_at: new Date().toISOString(),
             needs_check_at: trade.kickoff_at,  // Check at kickoff
-            total_stake: stake + (layPlaced ? layStake : 0),
-            // Lay order info
-            lay_order_ref: layBetId,
-            lay_price: layPlaced ? layTargetPrice : null,
-            lay_size: layPlaced ? layStake : null,
-            lay_placed_at: layPlaced ? new Date().toISOString() : null,
-            // State machine - enter MONITORING if lay placed, otherwise INITIAL
-            state_data: stateData,
+            total_stake: stake,  // Only back stake for now, lay added after match
+            // Lay order will be placed after back matches - keep these null
+            lay_order_ref: null,
+            lay_price: null,
+            lay_size: null,
+            lay_placed_at: null,
+            // State machine starts at INITIAL - will transition after lay is placed
+            state_data: { phase: 'INITIAL' },
         });
 
         trade.back_price = bestLayPrice;
         trade.back_size = stake;
         trade.back_stake = stake;
         trade.back_price_snapshot = trade.back_price_snapshot || bestLayPrice;
-        trade.total_stake = stake + (layPlaced ? layStake : 0);
+        trade.total_stake = stake;
         trade.back_order_ref = report.betId;
         trade.betfair_market_id = market.marketId;
         trade.selection_id = market.selectionId;
-        if (layPlaced) {
-          trade.lay_order_ref = layBetId;
-          trade.lay_price = layTargetPrice;
-          trade.lay_size = layStake;
-        }
 
         const backPlacedAt = new Date().toISOString();
         await this.logEvent(trade.id, 'BACK_PLACED', { 
@@ -1447,18 +1575,8 @@ class EplUnder25Strategy {
           betId: report.betId, 
           backPrice: bestBackPrice,
           timestamp: backPlacedAt,
+          note: 'Lay will be placed after back matches at kickoff',
         });
-        
-        if (layPlaced) {
-          const layPlacedAt = new Date().toISOString();
-          await this.logEvent(trade.id, 'LAY_PLACED', {
-            price: layTargetPrice,
-            stake: layStake,
-            betId: layBetId,
-            persistence: layPersistence,
-            timestamp: layPlacedAt,
-          });
-        }
         } else {
         this.logger.error(`[strategy:epl_under25] Failed to place BACK order: ${report?.errorCode}`);
         await this.logEvent(trade.id, 'BACK_FAILED', { errorCode: report?.errorCode });
@@ -1471,14 +1589,15 @@ class EplUnder25Strategy {
   async checkBackOrder(trade, now) {
     const sessionToken = await this.requireSessionWithRetry('back-order-check');
     
-    // This is now only called at/after kickoff for back_pending orders
     const kickoff = trade.kickoff_at ? new Date(trade.kickoff_at) : null;
     if (!kickoff) {
       this.logger.warn(`[strategy:epl_under25] checkBackOrder called but no kickoff time for trade ${trade.id}`);
       return;
     }
     
-    this.logger.log(`[strategy:epl_under25] Checking back order at kickoff for ${trade.event_id}`);
+    const isPreMatch = now < kickoff;
+    const eventName = trade.event_name || trade.fixture_name || trade.event_id || 'Unknown';
+    this.logger.log(`[strategy:epl_under25] Checking back order for ${eventName} (${isPreMatch ? 'PRE-MATCH' : 'AT/POST KICKOFF'})`);
     
     try {
         const res = await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/listCurrentOrders', {
@@ -1488,47 +1607,135 @@ class EplUnder25Strategy {
         const order = res?.currentOrders?.[0];
         
         if (!order) {
-            // Order not found - assume matched and cleared
-            this.logger.log(`[strategy:epl_under25] Order not found (likely matched and cleared) - proceeding to in-play`);
-            const assumedStake = trade.back_size || trade.back_stake || trade.target_stake || 0;
-            await this.updateTrade(trade.id, { 
-              status: 'back_matched', 
-              back_matched_size: trade.back_size, 
-              back_stake: assumedStake,
-              total_stake: assumedStake + (trade.lay_size || 0),
-              last_error: null 
+            // CRITICAL FIX: Order not found could mean:
+            // 1. Fully matched and cleared (good)
+            // 2. Cancelled/lapsed due to suspension (bad - no exposure)
+            // 3. Market closed (game over)
+            
+            // Check cleared orders to verify it actually matched
+            this.logger.log(`[strategy:epl_under25] Order ${trade.back_order_ref} not in current orders - checking cleared orders...`);
+            
+            try {
+              const clearedRes = await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/listClearedOrders', {
+                betIds: [trade.back_order_ref],
+                betStatus: 'SETTLED',
+              }, 'checkBackOrder-cleared');
+              
+              const clearedOrder = clearedRes?.clearedOrders?.[0];
+              if (clearedOrder && clearedOrder.sizeSettled > 0) {
+                // Verified: order was matched
+                const matchedStake = clearedOrder.sizeSettled;
+                const matchedPrice = clearedOrder.priceMatched;
+                
+                this.logger.log(`[strategy:epl_under25] ✓ Back order VERIFIED matched via cleared orders: £${matchedStake} @ ${matchedPrice}`);
+                
+                trade.back_matched_size = matchedStake;
+                trade.back_price = matchedPrice;
+                await this.logEvent(trade.id, 'BACK_VERIFIED_MATCHED', { 
+                  matchedStake, 
+                  matchedPrice, 
+                  source: 'cleared_orders',
+                  timestamp: new Date().toISOString(),
+                });
+                
+                await this.placeLayForGreenUp(trade, sessionToken, matchedStake, matchedPrice);
+                return;
+              }
+            } catch (clearErr) {
+              this.logger.warn(`[strategy:epl_under25] Cleared orders check failed: ${clearErr.message}`);
+            }
+            
+            // Order not in current or cleared - likely cancelled/lapsed
+            // SAFE: Do NOT place lay - no exposure exists
+            this.logger.warn(`[strategy:epl_under25] ⚠️ Back order ${trade.back_order_ref} NOT FOUND anywhere - likely cancelled/lapsed`);
+            this.logger.log(`[strategy:epl_under25] Terminating trade - no back exposure, no lay needed`);
+            
+            await this.updateTrade(trade.id, {
+              status: 'cancelled',
+              back_matched_size: 0,
+              back_stake: 0,
+              total_stake: 0,
+              last_error: 'BACK_ORDER_NOT_FOUND_CANCELLED',
             });
-            trade.status = 'back_matched';
-            trade.back_matched_size = trade.back_size;
-            trade.back_stake = assumedStake;
-            trade.total_stake = assumedStake + (trade.lay_size || 0);
-            await this.logEvent(trade.id, 'BACK_ASSUMED_MATCHED', {});
+            
+            await this.logEvent(trade.id, 'BACK_ORDER_LOST', {
+              betId: trade.back_order_ref,
+              reason: 'Order not in current or cleared orders - likely cancelled due to suspension',
+              timestamp: new Date().toISOString(),
+            });
             return;
         }
 
         // Check if order matched (fully or partially)
         if (order.status === 'EXECUTION_COMPLETE' || order.sizeMatched >= (trade.back_size || 0)) {
-            this.logger.log(`[strategy:epl_under25] ✓ Back bet MATCHED @ ${order.averagePriceMatched || order.price} - proceeding to in-play monitoring`);
             const matchedStake = order.sizeMatched || trade.back_size || trade.target_stake || 0;
-            await this.updateTrade(trade.id, {
-                status: 'back_matched',
-                back_matched_size: order.sizeMatched,
-                back_price: order.averagePriceMatched || order.price,
-                back_stake: matchedStake,
-                total_stake: matchedStake + (trade.lay_size || 0),
-                last_error: null,
-            });
-            trade.status = 'back_matched';
-            trade.back_matched_size = order.sizeMatched;
-            trade.back_price = order.averagePriceMatched || order.price;
-            trade.back_stake = matchedStake;
-            trade.total_stake = matchedStake + (trade.lay_size || 0);
+            const matchedPrice = order.averagePriceMatched || order.price;
+            
+            this.logger.log(`[strategy:epl_under25] ✓ Back bet FULLY MATCHED @ ${matchedPrice} (£${matchedStake}) ${isPreMatch ? 'PRE-MATCH' : ''} - placing lay for green-up`);
+            
+            trade.back_matched_size = matchedStake;
+            trade.back_price = matchedPrice;
             await this.logEvent(trade.id, 'BACK_MATCHED', { 
               order,
-              matched_price: order.averagePriceMatched || order.price,
-              matched_size: order.sizeMatched,
+              matched_price: matchedPrice,
+              matched_size: matchedStake,
+              pre_match: isPreMatch,
               timestamp: new Date().toISOString(),
             });
+            
+            // Place lay bet for green-up IMMEDIATELY (even pre-match)
+            // Lay uses PERSIST so it stays when market goes in-play
+            await this.placeLayForGreenUp(trade, sessionToken, matchedStake, matchedPrice);
+            return;
+        }
+
+        // Pre-match: if order still pending, check timeout guardrail
+        if (isPreMatch) {
+            const matchedAmount = order.sizeMatched || 0;
+            const unmatchedAmount = order.sizeRemaining || 0;
+            
+            if (matchedAmount > 0 && unmatchedAmount > 0) {
+                // PARTIAL MATCH TIMEOUT GUARDRAIL
+                // If partially matched for more than 1 minute, cancel remainder and green-up
+                const backPlacedAt = trade.back_placed_at ? new Date(trade.back_placed_at) : null;
+                const timeSincePlaced = backPlacedAt ? (now.getTime() - backPlacedAt.getTime()) / 1000 : 0;
+                const partialMatchTimeout = 60; // 1 minute
+                
+                if (timeSincePlaced >= partialMatchTimeout) {
+                    this.logger.log(`[strategy:epl_under25] ⏰ PARTIAL MATCH TIMEOUT: £${matchedAmount} matched, £${unmatchedAmount} unmatched after ${timeSincePlaced.toFixed(0)}s`);
+                    this.logger.log(`[strategy:epl_under25] Cancelling unmatched portion and placing lay for matched amount only`);
+                    
+                    // Cancel remaining back order
+                    await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/cancelOrders', {
+                        marketId: trade.betfair_market_id,
+                        instructions: [{ betId: trade.back_order_ref }],
+                    }, 'cancelBack-partial-timeout');
+                    
+                    const matchedPrice = order.averagePriceMatched || order.price;
+                    trade.back_matched_size = matchedAmount;
+                    trade.back_price = matchedPrice;
+                    
+                    await this.logEvent(trade.id, 'PARTIAL_MATCH_TIMEOUT', {
+                        matchedAmount,
+                        unmatchedAmount,
+                        matchedPrice,
+                        seconds_waited: timeSincePlaced,
+                        timestamp: new Date().toISOString(),
+                    });
+                    
+                    // Place lay for matched portion only
+                    await this.placeLayForGreenUp(trade, sessionToken, matchedAmount, matchedPrice);
+                    return;
+                }
+                
+                // Still within timeout - keep waiting
+                this.logger.log(`[strategy:epl_under25] Pre-match partial: £${matchedAmount} of £${trade.back_size} matched (${timeSincePlaced.toFixed(0)}s/${partialMatchTimeout}s timeout), waiting...`);
+            } else if (matchedAmount === 0) {
+                // Nothing matched yet - just wait
+                this.logger.log(`[strategy:epl_under25] Pre-match: back order pending, no matches yet`);
+            }
+            
+            // Still pending - will check again on next poll
             return;
         }
 
@@ -1539,7 +1746,7 @@ class EplUnder25Strategy {
             
             // Cancel any unmatched portion
             if (unmatchedAmount > 0) {
-                this.logger.log(`[strategy:epl_under25] Cancelling unmatched portion (${unmatchedAmount} of ${trade.back_size})`);
+                this.logger.log(`[strategy:epl_under25] Cancelling unmatched portion (£${unmatchedAmount} of £${trade.back_size})`);
                 await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/cancelOrders', {
                     marketId: trade.betfair_market_id,
                     instructions: [{ betId: trade.back_order_ref }],
@@ -1548,46 +1755,186 @@ class EplUnder25Strategy {
             
             // If ANY amount matched, proceed with the matched amount
             if (matchedAmount > 0) {
-                this.logger.log(`[strategy:epl_under25] ⚠️ Partial match: ${matchedAmount} matched of ${trade.back_size} - proceeding with matched amount`);
-                await this.updateTrade(trade.id, {
-                    status: 'back_matched',
-                    back_matched_size: matchedAmount,
-                    back_price: order.averagePriceMatched || order.price,
-                    back_stake: matchedAmount,
-                    total_stake: matchedAmount + (trade.lay_size || 0),
-                    last_error: null,
-                });
-                trade.status = 'back_matched';
+                const matchedPrice = order.averagePriceMatched || order.price;
+                this.logger.log(`[strategy:epl_under25] ⚠️ PARTIAL MATCH: £${matchedAmount} of £${trade.back_size} @ ${matchedPrice} - placing lay for green-up on matched portion`);
+                
                 trade.back_matched_size = matchedAmount;
-                trade.back_price = order.averagePriceMatched || order.price;
-                trade.back_stake = matchedAmount;
-                trade.total_stake = matchedAmount + (trade.lay_size || 0);
+                trade.back_price = matchedPrice;
                 await this.logEvent(trade.id, 'BACK_PARTIALLY_MATCHED', { 
                     order, 
                     matchedAmount,
-                    unmatchedAmount 
+                    unmatchedAmount,
+                    matchedPrice,
+                    timestamp: new Date().toISOString(),
                 });
+                
+                // Place lay bet for green-up on the matched portion only
+                await this.placeLayForGreenUp(trade, sessionToken, matchedAmount, matchedPrice);
             } else {
-                // Completely unmatched - cancel and terminate
-                this.logger.log(`[strategy:epl_under25] ✗ Back bet COMPLETELY UNMATCHED at kickoff - terminating trade`);
+                // Completely unmatched - cancel and terminate (no lay needed)
+                this.logger.log(`[strategy:epl_under25] ✗ Back bet COMPLETELY UNMATCHED at kickoff - terminating trade (no exposure)`);
                 await this.updateTrade(trade.id, { 
                     status: 'cancelled', 
                     back_stake: 0,
-                    total_stake: trade.lay_size || 0,
+                    back_matched_size: 0,
+                    total_stake: 0,
                     last_error: 'BACK_UNMATCHED_AT_KICKOFF - no liquidity at target price' 
                 });
                 trade.status = 'cancelled';
-                trade.back_stake = 0;
-                trade.total_stake = trade.lay_size || 0;
                 await this.logEvent(trade.id, 'BACK_CANCELLED', { 
                     order, 
-                    reason: 'Completely unmatched at kickoff' 
+                    reason: 'Completely unmatched at kickoff - no lay placed, no exposure' 
                 });
-                this.logger.log(`[strategy:epl_under25] Trade cancelled - no exposure`);
             }
         }
     } catch (err) {
         this.logger.error(`[strategy:epl_under25] checkBackOrder error: ${err.message}`);
+    }
+  }
+
+  /**
+   * Place lay bet after back is confirmed matched - calculates green-up stake
+   * Green-up formula: layStake = backMatchedStake * backPrice / layPrice
+   */
+  async placeLayForGreenUp(trade, sessionToken, backMatchedStake, backMatchedPrice) {
+    try {
+      // Get current market prices
+      const book = await this.getMarketBookSafe(trade.betfair_market_id, sessionToken, 'greenup-book');
+      const runner = book?.runners?.find(r => r.selectionId == trade.selection_id);
+      const currentLayPrice = runner?.ex?.availableToLay?.[0]?.price;
+      
+      if (!currentLayPrice) {
+        this.logger.error(`[strategy:epl_under25] No lay price available for green-up - trade exposed!`);
+        await this.updateTrade(trade.id, {
+          status: 'back_matched',
+          back_matched_size: backMatchedStake,
+          back_price: backMatchedPrice,
+          back_stake: backMatchedStake,
+          total_stake: backMatchedStake,
+          last_error: 'NO_LAY_PRICE_FOR_GREENUP',
+        });
+        return;
+      }
+
+      // Calculate lay stake for green-up: layStake = backStake * backPrice / layPrice
+      // CRITICAL: Use matched back price as anchor, NOT current market lay price
+      const layTicksCount = this.settings.lay_ticks_below_back || this.defaults.lay_ticks_below_back || 2;
+      const targetLayPrice = ticksBelow(backMatchedPrice, layTicksCount);
+      const greenUpLayStake = (backMatchedStake * backMatchedPrice) / targetLayPrice;
+      const layStake = Math.max(0, Math.round(greenUpLayStake * 100) / 100);
+      
+      this.logger.log(`[strategy:epl_under25] Green-up calculation: Back £${backMatchedStake} @ ${backMatchedPrice} → Lay £${layStake} @ ${targetLayPrice} (${layTicksCount} ticks below back price)`);
+      this.logger.log(`[strategy:epl_under25]   Formula: ${backMatchedStake} × ${backMatchedPrice} / ${targetLayPrice} = ${layStake} | Current market lay: ${currentLayPrice}`);
+
+      if (layStake <= 0) {
+        this.logger.error(`[strategy:epl_under25] Invalid lay stake calculated: ${layStake}`);
+        return;
+      }
+
+      // Place lay order with PERSIST (keeps in-play)
+      const layPersistence = this.settings.lay_persistence || this.defaults.lay_persistence || 'PERSIST';
+      const layCustomerRef = `LAY-GREENUP-${Date.now()}`;
+      
+      const layRes = await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/placeOrders', {
+        marketId: trade.betfair_market_id,
+        customerRef: layCustomerRef,
+        instructions: [{
+          selectionId: trade.selection_id,
+          side: 'LAY',
+          orderType: 'LIMIT',
+          limitOrder: {
+            size: layStake,
+            price: targetLayPrice,
+            persistenceType: layPersistence,  // PERSIST = keep in-play
+          },
+        }],
+      }, 'placeLay-greenup');
+      
+      const layReport = layRes?.instructionReports?.[0];
+      if (layReport && layReport.status === 'SUCCESS') {
+        const layBetId = layReport.betId;
+        this.logger.log(`[strategy:epl_under25] ✓ LAY ORDER PLACED for green-up: £${layStake} @ ${targetLayPrice} (persistence=${layPersistence}) - betId: ${layBetId}`);
+        
+        // Calculate expected green-up profit
+        const profitIfWins = backMatchedStake * (backMatchedPrice - 1) - layStake * (targetLayPrice - 1);
+        const profitIfLoses = layStake - backMatchedStake;
+        const commission = this.settings.commission_rate || this.defaults.commission_rate;
+        const expectedProfit = Math.min(profitIfWins, profitIfLoses) * (1 - commission);
+        this.logger.log(`[strategy:epl_under25]   Expected green-up profit: £${expectedProfit.toFixed(2)} (if wins: £${profitIfWins.toFixed(2)}, if loses: £${profitIfLoses.toFixed(2)})`);
+        
+        // Update trade with lay info and transition to back_matched (state machine will monitor)
+        await this.updateTrade(trade.id, {
+          status: 'back_matched',
+          back_matched_size: backMatchedStake,
+          back_price: backMatchedPrice,
+          back_stake: backMatchedStake,
+          lay_order_ref: layBetId,
+          lay_price: targetLayPrice,
+          lay_size: layStake,
+          lay_placed_at: new Date().toISOString(),
+          total_stake: backMatchedStake + layStake,
+          last_error: null,
+          // State machine - start at MONITORING since lay is placed
+          state_data: {
+            phase: 'MONITORING',
+            profit_order_id: layBetId,
+            last_stable_price: backMatchedPrice,
+            lay_snapshot: { stake: layStake, price: targetLayPrice },
+          },
+        });
+        
+        trade.status = 'back_matched';
+        trade.lay_order_ref = layBetId;
+        trade.lay_price = targetLayPrice;
+        trade.lay_size = layStake;
+        trade.total_stake = backMatchedStake + layStake;
+        
+        await this.logEvent(trade.id, 'LAY_PLACED', {
+          price: targetLayPrice,
+          stake: layStake,
+          betId: layBetId,
+          persistence: layPersistence,
+          green_up_calc: {
+            back_matched_stake: backMatchedStake,
+            back_matched_price: backMatchedPrice,
+            formula: 'backStake * backPrice / layPrice',
+          },
+          expected_profit: expectedProfit,
+          timestamp: new Date().toISOString(),
+        });
+        
+      } else {
+        const errorCode = layReport?.errorCode || layRes?.errorCode || 'unknown';
+        this.logger.error(`[strategy:epl_under25] ✗ LAY ORDER FAILED: ${errorCode} - trade is exposed!`);
+        
+        await this.updateTrade(trade.id, {
+          status: 'back_matched',
+          back_matched_size: backMatchedStake,
+          back_price: backMatchedPrice,
+          back_stake: backMatchedStake,
+          total_stake: backMatchedStake,
+          last_error: `LAY_PLACEMENT_FAILED: ${errorCode}`,
+          state_data: { phase: 'INITIAL' },  // Will retry lay placement
+        });
+        
+        await this.logEvent(trade.id, 'LAY_FAILED', { 
+          errorCode,
+          attempted_price: targetLayPrice,
+          attempted_stake: layStake,
+        });
+      }
+      
+    } catch (err) {
+      this.logger.error(`[strategy:epl_under25] placeLayForGreenUp error: ${err.message}`);
+      await this.updateTrade(trade.id, {
+        status: 'back_matched',
+        back_matched_size: backMatchedStake,
+        back_price: backMatchedPrice,
+        back_stake: backMatchedStake,
+        total_stake: backMatchedStake,
+        last_error: `LAY_PLACEMENT_EXCEPTION: ${err.message}`,
+        state_data: { phase: 'INITIAL' },
+      });
     }
   }
 
@@ -1653,6 +2000,9 @@ class EplUnder25Strategy {
     } = options;
 
     const commission = this.settings?.commission_rate ?? this.defaults.commission_rate;
+    
+    // FIX: Use || instead of ?? to skip explicit zeros
+    // Priority: matched amounts > requested amounts > fallbacks
     const backStake = Number(
       trade.back_matched_size ||
       trade.back_stake ||
@@ -1661,13 +2011,26 @@ class EplUnder25Strategy {
       0,
     );
     const backPrice = trade.back_price || trade.back_price_snapshot || trade.hedge_target_price;
+    
+    // FIX: Use || to skip explicit zeros in lay data
+    // layStakeOverride takes priority (for manual overrides)
+    // then lay_matched_size (actual matched), then lay_size (requested)
     const layStake = Number(
-      layStakeOverride ??
-      trade.lay_matched_size ??
-      trade.lay_size ??
+      layStakeOverride ||
+      trade.lay_matched_size ||
+      trade.lay_size ||
       0,
     );
-    const layPrice = layPriceOverride ?? trade.lay_price ?? trade.hedge_target_price;
+    const layPrice = layPriceOverride || trade.lay_price || trade.hedge_target_price || 0;
+    
+    // Validation logging - show exactly what values are being used
+    const eventName = trade.event_name || trade.fixture_name || trade.event_id || 'Unknown';
+    this.logger.log(`[strategy:epl_under25] Settlement calc for ${eventName}:`);
+    this.logger.log(`[strategy:epl_under25]   Back: £${backStake} @ ${backPrice} (matched=${trade.back_matched_size}, stake=${trade.back_stake}, size=${trade.back_size})`);
+    this.logger.log(`[strategy:epl_under25]   Lay:  £${layStake} @ ${layPrice} (matched=${trade.lay_matched_size}, size=${trade.lay_size}, override=${layStakeOverride})`);
+    this.logger.log(`[strategy:epl_under25]   Commission: ${(commission * 100).toFixed(2)}%`);
+    
+    // Calculate P&L - now returns null if lay data is missing
     const realised = computeRealisedPnlSnapshot({
       backStake,
       backPrice,
@@ -1676,10 +2039,16 @@ class EplUnder25Strategy {
       commission,
     });
 
+    // Handle null P&L (lay not matched - trade incomplete)
+    if (realised === null) {
+      this.logger.warn(`[strategy:epl_under25] ⚠️ Cannot calculate P&L - lay data missing (layStake=${layStake}, layPrice=${layPrice})`);
+      this.logger.warn(`[strategy:epl_under25]   Trade ${eventName} will be marked hedged but P&L is NULL (incomplete data)`);
+    }
+
     const patch = {
       status: 'hedged',
       lay_matched_size: layStake || null,
-      realised_pnl: realised,
+      realised_pnl: realised,  // May be null if lay data missing
       pnl: realised,
       settled_at: new Date().toISOString(),
       total_stake: backStake + layStake,
@@ -1689,10 +2058,13 @@ class EplUnder25Strategy {
 
     await this.updateTrade(trade.id, patch);
 
-    // Log clear profit/loss outcome
-    const outcomeSymbol = realised >= 0 ? '✓ PROFIT' : '✗ LOSS';
-    const eventName = trade.event_name || trade.fixture_name || trade.event_id || 'Unknown';
-    this.logger.log(`[strategy:epl_under25] ${outcomeSymbol}: £${realised.toFixed(2)} on ${eventName}`);
+    // Log clear profit/loss outcome (handle null realised)
+    if (realised !== null) {
+      const outcomeSymbol = realised >= 0 ? '✓ PROFIT' : '✗ LOSS';
+      this.logger.log(`[strategy:epl_under25] ${outcomeSymbol}: £${realised.toFixed(2)} on ${eventName}`);
+    } else {
+      this.logger.log(`[strategy:epl_under25] ⚠️ P&L UNKNOWN (incomplete data) on ${eventName}`);
+    }
     this.logger.log(`[strategy:epl_under25]   Back: £${backStake.toFixed(2)} @ ${backPrice} | Lay: £${layStake.toFixed(2)} @ ${layPrice}`);
 
     await this.logEvent(trade.id, 'TRADE_SETTLED', {
@@ -1702,7 +2074,7 @@ class EplUnder25Strategy {
       lay_stake: layStake,
       lay_price: layPrice,
       commission,
-      outcome: realised >= 0 ? 'profit' : 'loss',
+      outcome: realised === null ? 'unknown' : (realised >= 0 ? 'profit' : 'loss'),
     });
 
     trade.status = 'hedged';

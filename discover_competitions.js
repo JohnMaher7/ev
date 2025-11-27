@@ -1,7 +1,8 @@
 /**
  * Competition Discovery Script
  * Run this to find Betfair competition IDs and exact names
- * 
+ *  $env:DOTENV_CONFIG_PATH=".env.bot"
+ * node -r dotenv/config discover_competitions.js
  * Usage: node discover_competitions.js
  */
 
@@ -41,7 +42,7 @@ async function discoverCompetitions() {
     console.log(`Found ${result.length} total soccer competitions\n`);
     
     // Filter for major European leagues
-    const searchTerms = ['premier', 'liga', 'serie', 'bundesliga', 'ligue', 'champions'];
+    const searchTerms = ['premier', 'liga', 'serie', 'bundesliga', 'ligue', 'europa'];
     const filtered = result.filter(c => {
       const name = c.competition?.name?.toLowerCase() || '';
       return searchTerms.some(term => name.includes(term));

@@ -11,7 +11,10 @@
     "lint": "eslint",
     "test": "jest",
     "test:watch": "jest --watch",
-    "test:ci": "jest --ci --runInBand"
+    "test:ci": "jest --ci --runInBand",
+    "debug:trades": "node scripts/debug-trades.js",
+    "debug:trades:failed": "node scripts/debug-trades.js --failed-only",
+    "debug:trades:detailed": "node scripts/debug-trades.js --events"
   },
   "dependencies": {
     "node-cron": "^3.0.3",

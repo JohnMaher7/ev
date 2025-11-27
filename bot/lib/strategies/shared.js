@@ -17,6 +17,7 @@ const COMPETITION_MATCHERS = [
   /^Spanish La Liga$/i,          // La Liga
   /^Italian Serie A$/i,          // Serie A
   /^UEFA Champions League$/i,    // Champions League
+  /^UEFA Europa League$/i,  // UEFA Europa League
 ];
 
 // Competition IDs from Betfair
@@ -25,7 +26,8 @@ const COMPETITION_IDS = [
   '59',        // German Bundesliga
   '117',       // Spanish La Liga
   '81',        // Italian Serie A
-  '228',       // UEFA Champions League
+  '228',       //UEFA Champions League
+  '2005',      // UEFA Europa League
 ];
 
 // --- Stake/Price Calculations ---
@@ -82,26 +84,42 @@ function computeTargetLayPrice(backPrice, settings) {
 }
 
 /**
- * Calculate realised P&L snapshot
+ * Calculate realised P&L snapshot for a green-up/red-up trade.
+ * 
+ * IMPORTANT: Only returns a P&L value when BOTH back AND lay bets are matched.
+ * Returns null if either back or lay data is missing - prevents storing incorrect
+ * unhedged profits as realised P&L.
+ * 
+ * Green-up formula:
+ * - Profit if selection wins:  backStake × (backPrice - 1) - layStake × (layPrice - 1)
+ * - Profit if selection loses: layStake - backStake
+ * - Realised P&L = min(profitIfWins, profitIfLoses) × (1 - commission)
  */
 function computeRealisedPnlSnapshot({ backStake, backPrice, layStake, layPrice, commission = 0.02 }) {
+  // Return null if back data is missing
   if (!backStake || !backPrice) {
     return null;
   }
   
-  if (!layStake || !layPrice) {
-    const profitBeforeComm = backStake * (backPrice - 1);
-    const profit = profitBeforeComm * (1 - commission);
-    return Number(profit.toFixed(2));
+  // CRITICAL FIX: Return null if lay data is missing
+  // Do NOT calculate unhedged profit - the trade isn't complete yet
+  if (!layStake || layStake <= 0 || !layPrice || layPrice <= 0) {
+    return null;  // Trade not hedged - no P&L to report
   }
   
-  const profitBackBeforeComm = backStake * (backPrice - 1) - layStake * (layPrice - 1);
-  const profitBack = profitBackBeforeComm * (1 - commission);
+  // Both back and lay are present - calculate green-up P&L
+  // Profit if selection WINS (back bet wins, lay bet loses)
+  const profitIfWins = backStake * (backPrice - 1) - layStake * (layPrice - 1);
   
-  const profitLayBeforeComm = layStake - backStake;
-  const profitLay = profitLayBeforeComm * (1 - commission);
+  // Profit if selection LOSES (back bet loses, lay bet wins)
+  const profitIfLoses = layStake - backStake;
   
-  const realised = Math.min(profitBack, profitLay);
+  // Apply commission to both scenarios
+  const profitWinsAfterComm = profitIfWins * (1 - commission);
+  const profitLosesAfterComm = profitIfLoses * (1 - commission);
+  
+  // Realised P&L is the guaranteed minimum profit (or maximum loss)
+  const realised = Math.min(profitWinsAfterComm, profitLosesAfterComm);
   return Number(realised.toFixed(2));
 }
 
@@ -252,6 +270,100 @@ function createSafeApiWrappers(betfair, logger) {
     }
   }
 
+  /**
+   * Get full order details including matched/remaining sizes
+   * CRITICAL: Use this to verify actual matched amounts before settling
+   * 
+   * Returns: { status, sizeMatched, sizeRemaining, averagePriceMatched, betId } or null
+   */
+  async function getOrderDetailsSafe(betId, sessionToken, label) {
+    if (!betId) return null;
+    try {
+      const res = await rpcWithRetry(sessionToken, 'SportsAPING/v1.0/listCurrentOrders', {
+        betIds: [betId],
+        orderProjection: 'ALL',
+      }, label);
+      const order = res?.currentOrders?.[0];
+      if (!order) {
+        // Order not found - might be fully matched and cleared, or cancelled
+        // Check cleared orders
+        try {
+          const clearedRes = await rpcWithRetry(sessionToken, 'SportsAPING/v1.0/listClearedOrders', {
+            betIds: [betId],
+            betStatus: 'SETTLED',
+          }, `${label}-cleared`);
+          const clearedOrder = clearedRes?.clearedOrders?.[0];
+          if (clearedOrder) {
+            return {
+              status: 'EXECUTION_COMPLETE',
+              sizeMatched: clearedOrder.sizeSettled || clearedOrder.priceMatched || 0,
+              sizeRemaining: 0,
+              averagePriceMatched: clearedOrder.priceMatched,
+              betId,
+              cleared: true,
+            };
+          }
+        } catch {
+          // Cleared orders check failed, order might be cancelled
+        }
+        return null;
+      }
+      return {
+        status: order.status,
+        sizeMatched: order.sizeMatched || 0,
+        sizeRemaining: order.sizeRemaining || 0,
+        averagePriceMatched: order.averagePriceMatched || order.price,
+        betId: order.betId,
+        side: order.side,
+        price: order.price,
+        persistenceType: order.persistenceType,
+        cleared: false,
+      };
+    } catch (err) {
+      logger.error(`[shared] getOrderDetailsSafe error for ${betId}: ${err.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Verify an order is ACTUALLY matched (not just status check)
+   * Returns: { matched: boolean, sizeMatched: number, cancelled: boolean, lapsed: boolean }
+   */
+  async function verifyOrderMatched(betId, expectedSize, sessionToken, label) {
+    const details = await getOrderDetailsSafe(betId, sessionToken, label);
+    
+    if (!details) {
+      // Order not found anywhere - treat as cancelled/lapsed
+      logger.warn(`[shared] Order ${betId} not found - treating as cancelled`);
+      return { matched: false, sizeMatched: 0, cancelled: true, lapsed: false, details: null };
+    }
+    
+    const sizeMatched = details.sizeMatched || 0;
+    const sizeRemaining = details.sizeRemaining || 0;
+    
+    // EXECUTION_COMPLETE = fully matched
+    if (details.status === 'EXECUTION_COMPLETE') {
+      return { matched: true, sizeMatched, cancelled: false, lapsed: false, details };
+    }
+    
+    // EXECUTABLE = partially matched, still open
+    if (details.status === 'EXECUTABLE') {
+      const partiallyMatched = sizeMatched > 0;
+      return { 
+        matched: false, 
+        sizeMatched, 
+        cancelled: false, 
+        lapsed: false, 
+        partiallyMatched,
+        details 
+      };
+    }
+    
+    // Any other status (CANCELLED, etc.) - order is dead
+    logger.warn(`[shared] Order ${betId} has unexpected status: ${details.status}`);
+    return { matched: false, sizeMatched, cancelled: true, lapsed: false, details };
+  }
+
   async function cancelOrderSafe(betId, sessionToken, label) {
     if (!betId) return;
     try {
@@ -297,6 +409,8 @@ function createSafeApiWrappers(betfair, logger) {
     rpcWithRetry,
     getMarketBookSafe,
     getOrderStatusSafe,
+    getOrderDetailsSafe,
+    verifyOrderMatched,
     cancelOrderSafe,
     placeLimitOrderSafe,
   };

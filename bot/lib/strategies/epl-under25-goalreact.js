@@ -159,6 +159,7 @@ class EplUnder25GoalReactStrategy {
 
   async calculateNextWakeTime() {
     const now = Date.now();
+    const nowIso = new Date().toISOString();
     
     // Priority 1: Check for active trades that need monitoring
     const { data: activeTrades } = await this.supabase
@@ -169,33 +170,49 @@ class EplUnder25GoalReactStrategy {
       .limit(1);
     
     if (activeTrades?.length > 0) {
-      this.logger.log(`[strategy:${STRATEGY_KEY}] Active trades detected - need immediate polling`);
+      this.logger.log(`[strategy:${STRATEGY_KEY}] Active trades detected (status: ${activeTrades[0].status}) - need immediate polling`);
       return 0;
     }
     
-    // Priority 2: Check for games about to kick off
-    const { data: upcomingGames } = await this.supabase
+    // Priority 2: Check for scheduled games that have ALREADY kicked off (need to start watching!)
+    // These are games with status='scheduled' but kickoff_at <= now (up to 90 mins ago)
+    const ninetyMinsAgo = new Date(now - 90 * 60 * 1000).toISOString();
+    const { data: kickedOffGames } = await this.supabase
       .from('strategy_trades')
-      .select('kickoff_at, event_id')
+      .select('kickoff_at, event_id, event_name')
       .eq('strategy_key', STRATEGY_KEY)
       .eq('status', 'scheduled')
-      .gt('kickoff_at', new Date().toISOString())
+      .lte('kickoff_at', nowIso)  // Kickoff has passed
+      .gte('kickoff_at', ninetyMinsAgo)  // But not more than 90 mins ago (still in play)
+      .order('kickoff_at', { ascending: true })
+      .limit(1);
+    
+    if (kickedOffGames?.length > 0) {
+      const eventName = kickedOffGames[0].event_name || kickedOffGames[0].event_id;
+      const kickoffTime = new Date(kickedOffGames[0].kickoff_at);
+      const minsFromKickoff = Math.round((now - kickoffTime.getTime()) / 60000);
+      this.logger.log(`[strategy:${STRATEGY_KEY}] ⚽ GAME IN PLAY: ${eventName} (kicked off ${minsFromKickoff} mins ago) - BEGIN WATCHING`);
+      return 0;  // Wake immediately to start watching
+    }
+    
+    // Priority 3: Check for games about to kick off (future kickoff times)
+    const { data: upcomingGames } = await this.supabase
+      .from('strategy_trades')
+      .select('kickoff_at, event_id, event_name')
+      .eq('strategy_key', STRATEGY_KEY)
+      .eq('status', 'scheduled')
+      .gt('kickoff_at', nowIso)  // Kickoff in the future
       .order('kickoff_at', { ascending: true })
       .limit(1);
     
     if (upcomingGames?.length > 0) {
       const kickoff = new Date(upcomingGames[0].kickoff_at).getTime();
       const delay = kickoff - now;
-      
-      // Wake up at kickoff time (delay <= 0 means game has started or starting now)
-      if (delay <= 0) {
-        this.logger.log(`[strategy:${STRATEGY_KEY}] Game KICKOFF - begin watching for goals`);
-        return 0;
-      }
+      const eventName = upcomingGames[0].event_name || upcomingGames[0].event_id;
       
       // Sleep until kickoff, capped between 1 minute and 24 hours
       const cappedDelay = Math.max(60 * 1000, Math.min(delay, 24 * 60 * 60 * 1000));
-      this.logger.log(`[strategy:${STRATEGY_KEY}] Next kickoff in ${(cappedDelay / 60000).toFixed(1)} min - sleeping until then`);
+      this.logger.log(`[strategy:${STRATEGY_KEY}] Next kickoff: ${eventName} in ${(cappedDelay / 60000).toFixed(1)} min - sleeping until then`);
       return cappedDelay;
     }
     
@@ -521,16 +538,32 @@ class EplUnder25GoalReactStrategy {
   async processTradeStateMachine(trade, now, minsFromKickoff) {
     let state = trade.state_data || { phase: PHASE.WATCHING };
     const phase = state.phase || PHASE.WATCHING;
+    const eventName = trade.event_name || trade.event_id || 'Unknown';
+    
+    // Diagnostic: Log trade being processed
+    this.logger.log(`[strategy:${STRATEGY_KEY}] Processing: ${eventName} | phase=${phase} | status=${trade.status} | min=${minsFromKickoff.toFixed(0)}`);
     
     const sessionToken = await this.requireSessionWithRetry(`sm-${phase}`);
     const market = await this.ensureMarketForTrade(trade, sessionToken);
-    if (!market) return;
+    if (!market) {
+      this.logger.warn(`[strategy:${STRATEGY_KEY}] ⚠️ No market found for ${eventName} - skipping`);
+      return;
+    }
 
     const book = await this.getMarketBookSafe(market.marketId, sessionToken, `${phase}-book`);
-    if (!book) return;
+    if (!book) {
+      this.logger.warn(`[strategy:${STRATEGY_KEY}] ⚠️ No market book for ${eventName} (marketId: ${market.marketId}) - skipping`);
+      return;
+    }
+
+    // Diagnostic: Log market status (critical for debugging)
+    const marketStatus = book.status || 'UNKNOWN';
+    const isInPlay = book.inplay === true;
+    this.logger.log(`[strategy:${STRATEGY_KEY}]   Market: ${market.marketId} | status=${marketStatus} | inplay=${isInPlay}`);
 
     // Check if market closed
     if (book.status === 'CLOSED') {
+      this.logger.log(`[strategy:${STRATEGY_KEY}] Market CLOSED for ${eventName} - settling trade`);
       await this.settleTradeWithPnl(trade, state, 'MARKET_CLOSED');
       return;
     }
@@ -540,9 +573,12 @@ class EplUnder25GoalReactStrategy {
     const currentLayPrice = runner?.ex?.availableToLay?.[0]?.price;
 
     if (!currentBackPrice || !currentLayPrice) {
-      this.logger.log(`[strategy:${STRATEGY_KEY}] No prices available for ${trade.event_name}`);
+      this.logger.log(`[strategy:${STRATEGY_KEY}] ⚠️ No prices for ${eventName} (back=${currentBackPrice}, lay=${currentLayPrice}) - waiting`);
       return;
     }
+    
+    // Diagnostic: Log current prices
+    this.logger.log(`[strategy:${STRATEGY_KEY}]   Prices: back=${currentBackPrice} | lay=${currentLayPrice} | spread=${(currentLayPrice - currentBackPrice).toFixed(2)}`);
 
     switch (phase) {
       case PHASE.WATCHING:
@@ -591,6 +627,10 @@ class EplUnder25GoalReactStrategy {
 
     // Check for goal (30% price spike)
     const priceChange = ((backPrice - state.baseline_price) / state.baseline_price) * 100;
+    
+    // Diagnostic: Log price vs baseline on each poll
+    const eventName = trade.event_name || trade.event_id || 'Unknown';
+    this.logger.log(`[strategy:${STRATEGY_KEY}]   WATCHING ${eventName}: price=${backPrice} | baseline=${state.baseline_price} | change=${priceChange.toFixed(1)}% | threshold=${goalDetectionPct}%`);
     
     if (priceChange >= goalDetectionPct) {
       this.logger.log(`[strategy:${STRATEGY_KEY}] 🎯 GOAL DETECTED! Price spike: ${priceChange.toFixed(1)}% (${state.baseline_price} → ${backPrice})`);
@@ -717,89 +757,320 @@ class EplUnder25GoalReactStrategy {
     );
 
     if (placeRes.status === 'SUCCESS') {
-      this.logger.log(`[strategy:${STRATEGY_KEY}] ✓ ENTERED @ ${entryPrice} - betId: ${placeRes.betId}`);
+      this.logger.log(`[strategy:${STRATEGY_KEY}] ✓ BACK PLACED @ ${entryPrice} - betId: ${placeRes.betId}`);
       
-      state.phase = PHASE.LIVE;
       state.entry_price = entryPrice;
       state.entry_time = Date.now();
       state.back_bet_id = placeRes.betId;
+      state.target_stake = stake;
       
-      await this.updateTrade(trade.id, {
-        status: 'live',
-        state_data: state,
-        back_price: entryPrice,
-        back_size: stake,
-        back_stake: stake,
-        back_order_ref: placeRes.betId,
-        back_placed_at: new Date().toISOString(),
-        betfair_market_id: market.marketId,
-        selection_id: market.selectionId,
-      });
-      const positionEnteredAt = new Date().toISOString();
-      await this.logEvent(trade.id, 'POSITION_ENTERED', { 
-        price_entered: entryPrice,
-        entry_price: entryPrice,
-        stake,
-        back_price: backPrice,
-        lay_price: layPrice,
-        bet_id: placeRes.betId,
-        timestamp: positionEnteredAt,
-      });
+      // CRITICAL FIX: Wait to verify back order actually matched BEFORE placing lay
+      // Goal reactions can cause market suspensions - back might not match
+      await this.waitAndVerifyBackThenPlaceLay(trade, state, placeRes.betId, stake, entryPrice, sessionToken, market);
+      
     } else {
       this.logger.error(`[strategy:${STRATEGY_KEY}] Entry failed: ${placeRes.errorCode}`);
       await this.logEvent(trade.id, 'ENTRY_FAILED', { errorCode: placeRes.errorCode });
     }
   }
 
-  async handleLive(trade, state, backPrice, layPrice, sessionToken, market) {
+  /**
+   * CRITICAL: Verify back order matched before placing lay
+   * Handles: suspensions, partial matches, cancellations
+   */
+  async waitAndVerifyBackThenPlaceLay(trade, state, backBetId, stake, entryPrice, sessionToken, market) {
+    const maxWaitMs = 5000; // Wait up to 5 seconds for back to match
+    const pollIntervalMs = 500;
+    let elapsed = 0;
+    let backMatchedSize = 0;
+    let backMatchedPrice = entryPrice;
+    
+    this.logger.log(`[strategy:${STRATEGY_KEY}] Verifying back order ${backBetId} matches before placing lay...`);
+    
+    while (elapsed < maxWaitMs) {
+      const orderDetails = await this.getOrderDetailsSafe(backBetId, sessionToken, 'verify-back-match');
+      
+      if (!orderDetails) {
+        // Order not found - might be matched and cleared, or cancelled
+        this.logger.warn(`[strategy:${STRATEGY_KEY}] Back order not found after ${elapsed}ms - checking if matched...`);
+        break;
+      }
+      
+      if (orderDetails.status === 'EXECUTION_COMPLETE') {
+        // Fully matched
+        backMatchedSize = orderDetails.sizeMatched || stake;
+        backMatchedPrice = orderDetails.averagePriceMatched || entryPrice;
+        this.logger.log(`[strategy:${STRATEGY_KEY}] ✓ Back FULLY MATCHED: £${backMatchedSize} @ ${backMatchedPrice}`);
+        break;
+      }
+      
+      if (orderDetails.sizeMatched > 0) {
+        // Partially matched
+        backMatchedSize = orderDetails.sizeMatched;
+        backMatchedPrice = orderDetails.averagePriceMatched || entryPrice;
+        
+        // If more than 50% matched, proceed with what we have
+        if (backMatchedSize >= stake * 0.5) {
+          this.logger.log(`[strategy:${STRATEGY_KEY}] Back ${(backMatchedSize / stake * 100).toFixed(0)}% matched (£${backMatchedSize}) - proceeding with matched portion`);
+          
+          // Cancel remaining
+          await this.cancelOrderSafe(backBetId, sessionToken, 'cancel-unmatched-back');
+          break;
+        }
+      }
+      
+      // Wait and retry
+      await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+      elapsed += pollIntervalMs;
+    }
+    
+    // Final check if nothing matched in loop
+    if (backMatchedSize === 0) {
+      const finalCheck = await this.getOrderDetailsSafe(backBetId, sessionToken, 'final-back-check');
+      
+      if (finalCheck && finalCheck.sizeMatched > 0) {
+        backMatchedSize = finalCheck.sizeMatched;
+        backMatchedPrice = finalCheck.averagePriceMatched || entryPrice;
+      } else if (!finalCheck) {
+        // Order disappeared - might be matched and cleared
+        // Check if it was a successful execution
+        this.logger.warn(`[strategy:${STRATEGY_KEY}] Back order disappeared - assuming cancelled (market suspension?)`);
+        
+        // SAFE: Don't place lay - no exposure
+        state.phase = PHASE.SKIPPED;
+        await this.updateTrade(trade.id, {
+          status: 'skipped',
+          state_data: state,
+          back_order_ref: backBetId,
+          back_matched_size: 0,
+          last_error: 'BACK_NOT_MATCHED_SUSPENSION',
+        });
+        
+        await this.logEvent(trade.id, 'BACK_NOT_MATCHED', {
+          betId: backBetId,
+          reason: 'Order not found - likely cancelled due to market suspension',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+    }
+    
+    // If STILL nothing matched, cancel and skip
+    if (backMatchedSize === 0) {
+      this.logger.warn(`[strategy:${STRATEGY_KEY}] ⚠️ Back did NOT match after ${elapsed}ms - cancelling and skipping`);
+      
+      await this.cancelOrderSafe(backBetId, sessionToken, 'cancel-unmatched-back');
+      
+      state.phase = PHASE.SKIPPED;
+      await this.updateTrade(trade.id, {
+        status: 'skipped',
+        state_data: state,
+        back_order_ref: backBetId,
+        back_matched_size: 0,
+        last_error: 'BACK_NOT_MATCHED_NO_LIQUIDITY',
+      });
+      
+      await this.logEvent(trade.id, 'BACK_NOT_MATCHED', {
+        betId: backBetId,
+        reason: 'No matches after timeout - no lay placed, no exposure',
+        waited_ms: elapsed,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+    
+    // Back matched (fully or partially) - NOW place lay
+    this.logger.log(`[strategy:${STRATEGY_KEY}] Back verified matched: £${backMatchedSize} @ ${backMatchedPrice} - placing lay hedge`);
+    
     const profitTargetPct = this.settings?.profit_target_pct || this.defaults.profit_target_pct;
+    const targetLayPrice = roundToBetfairTick(backMatchedPrice / (1 + profitTargetPct / 100));
+    const { layStake } = calculateLayStake({
+      backStake: backMatchedSize,  // Use ACTUAL matched size
+      backPrice: backMatchedPrice,
+      layPrice: targetLayPrice,
+      commission: this.settings?.commission_rate || this.defaults.commission_rate,
+    });
+    
+    this.logger.log(`[strategy:${STRATEGY_KEY}] Placing LAY hedge @ ${targetLayPrice} (${profitTargetPct}% profit target) - stake: £${layStake}`);
+    
+    const layRes = await this.placeLimitOrderSafe(
+      market.marketId,
+      market.selectionId,
+      'LAY',
+      layStake,
+      targetLayPrice,
+      sessionToken,
+      'goalreact-hedge',
+      'PERSIST'  // Keep in-play
+    );
+    
+    if (layRes.status === 'SUCCESS') {
+      this.logger.log(`[strategy:${STRATEGY_KEY}] ✓ LAY HEDGE PLACED @ ${targetLayPrice} - betId: ${layRes.betId}`);
+      
+      state.phase = PHASE.LIVE;
+      state.lay_bet_id = layRes.betId;
+      state.target_lay_price = targetLayPrice;
+      
+      await this.updateTrade(trade.id, {
+        status: 'live',
+        state_data: state,
+        back_price: backMatchedPrice,
+        back_size: backMatchedSize,
+        back_stake: backMatchedSize,
+        back_matched_size: backMatchedSize,
+        back_order_ref: backBetId,
+        back_placed_at: new Date().toISOString(),
+        lay_price: targetLayPrice,
+        lay_size: layStake,
+        lay_order_ref: layRes.betId,
+        lay_placed_at: new Date().toISOString(),
+        betfair_market_id: market.marketId,
+        selection_id: market.selectionId,
+      });
+      
+      await this.logEvent(trade.id, 'POSITION_ENTERED', { 
+        entry_price: backMatchedPrice,
+        stake: backMatchedSize,
+        back_bet_id: backBetId,
+        back_matched_verified: true,
+        lay_price: targetLayPrice,
+        lay_stake: layStake,
+        lay_bet_id: layRes.betId,
+        timestamp: new Date().toISOString(),
+      });
+    } else {
+      // Lay failed - position is exposed, flag critical error
+      this.logger.error(`[strategy:${STRATEGY_KEY}] ⚠️ LAY HEDGE FAILED: ${layRes.errorCode} - POSITION EXPOSED!`);
+      
+      state.phase = PHASE.LIVE;
+      state.lay_failed = true;
+      state.lay_error = layRes.errorCode;
+      
+      await this.updateTrade(trade.id, {
+        status: 'live',
+        state_data: state,
+        back_price: backMatchedPrice,
+        back_size: backMatchedSize,
+        back_stake: backMatchedSize,
+        back_matched_size: backMatchedSize,
+        back_order_ref: backBetId,
+        back_placed_at: new Date().toISOString(),
+        betfair_market_id: market.marketId,
+        selection_id: market.selectionId,
+        last_error: `LAY_HEDGE_FAILED: ${layRes.errorCode} - EXPOSED`,
+      });
+      
+      await this.logEvent(trade.id, 'LAY_HEDGE_FAILED', { 
+        entry_price: backMatchedPrice,
+        back_matched: backMatchedSize,
+        target_lay_price: targetLayPrice,
+        error: layRes.errorCode,
+        exposed: true,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+
+  /**
+   * Get full order details including matched/remaining sizes
+   */
+  async getOrderDetailsSafe(betId, sessionToken, label) {
+    if (!betId) return null;
+    try {
+      const res = await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/listCurrentOrders', {
+        betIds: [betId],
+        orderProjection: 'ALL',
+      }, label);
+      const order = res?.currentOrders?.[0];
+      if (!order) return null;
+      return {
+        status: order.status,
+        sizeMatched: order.sizeMatched || 0,
+        sizeRemaining: order.sizeRemaining || 0,
+        averagePriceMatched: order.averagePriceMatched || order.price,
+        betId: order.betId,
+      };
+    } catch (err) {
+      this.logger.error(`[strategy:${STRATEGY_KEY}] getOrderDetailsSafe error: ${err.message}`);
+      return null;
+    }
+  }
+
+  async handleLive(trade, state, backPrice, layPrice, sessionToken, market) {
     const goalDetectionPct = this.settings?.goal_detection_pct || this.defaults.goal_detection_pct;
     
     const entryPrice = state.entry_price;
-    const priceDropPct = ((entryPrice - backPrice) / entryPrice) * 100;
+    const layBetId = state.lay_bet_id || trade.lay_order_ref;
     
-    // Check for WIN (price dropped 10% from entry)
-    if (priceDropPct >= profitTargetPct) {
-      this.logger.log(`[strategy:${STRATEGY_KEY}] 🏆 WIN! Price dropped ${priceDropPct.toFixed(1)}% (${entryPrice} → ${backPrice})`);
+    // Check if lay order has matched (profit target reached)
+    if (layBetId) {
+      // CRITICAL FIX: Verify ACTUAL matched size, not just status
+      const orderDetails = await this.getOrderDetailsSafe(layBetId, sessionToken, 'live-verify-lay');
       
-      // Exit position - place LAY to close
-      const stake = trade.back_stake || trade.back_size;
-      const { layStake } = calculateLayStake({
-        backStake: stake,
-        backPrice: entryPrice,
-        layPrice: backPrice,
-        commission: this.settings?.commission_rate || this.defaults.commission_rate,
-      });
+      if (!orderDetails) {
+        // Lay order not found - might be cancelled due to suspension
+        this.logger.warn(`[strategy:${STRATEGY_KEY}] ⚠️ Lay order ${layBetId} NOT FOUND - checking exposure`);
+        
+        const backMatched = trade.back_matched_size || trade.back_stake || trade.back_size || 0;
+        if (backMatched > 0 && !state.emergency_hedge_attempted) {
+          this.logger.warn(`[strategy:${STRATEGY_KEY}] ⚠️ EXPOSED: £${backMatched} back matched, lay disappeared - placing emergency hedge`);
+          state.emergency_hedge_attempted = true;
+          await this.placeEmergencyHedge(trade, state, backMatched, sessionToken, market);
+        }
+        return;
+      }
       
-      const layRes = await this.placeLimitOrderSafe(
-        market.marketId,
-        market.selectionId,
-        'LAY',
-        layStake,
-        backPrice,
-        sessionToken,
-        'goalreact-win-exit'
-      );
+      // Check if lay was cancelled/lapsed
+      if (orderDetails.status !== 'EXECUTABLE' && orderDetails.status !== 'EXECUTION_COMPLETE') {
+        this.logger.warn(`[strategy:${STRATEGY_KEY}] Lay order status: ${orderDetails.status} - may have been cancelled`);
+        
+        if (orderDetails.sizeMatched > 0) {
+          // Partial lay match - settle with what matched
+          this.logger.log(`[strategy:${STRATEGY_KEY}] Lay partially matched £${orderDetails.sizeMatched} before cancel`);
+          await this.settleTradeWithPnl(trade, state, 'PARTIAL_LAY', {
+            layPrice: orderDetails.averagePriceMatched,
+            layStake: orderDetails.sizeMatched,
+          });
+        } else if (!state.emergency_hedge_attempted) {
+          // No lay matched - need emergency hedge
+          const backMatched = trade.back_matched_size || trade.back_stake || 0;
+          state.emergency_hedge_attempted = true;
+          await this.placeEmergencyHedge(trade, state, backMatched, sessionToken, market);
+        }
+        return;
+      }
       
-      if (layRes.status === 'SUCCESS') {
+      if (orderDetails.status === 'EXECUTION_COMPLETE' || (orderDetails.sizeMatched > 0 && orderDetails.sizeRemaining === 0)) {
+        // Verify actual matched size
+        const actualMatchedSize = orderDetails.sizeMatched || 0;
+        const layMatchedPrice = orderDetails.averagePriceMatched || state.target_lay_price || trade.lay_price;
+        
+        this.logger.log(`[strategy:${STRATEGY_KEY}] 🏆 WIN! Lay verified matched: £${actualMatchedSize} @ ${layMatchedPrice}`);
+        
         state.phase = PHASE.COMPLETED;
-        state.exit_price = backPrice;
+        state.exit_price = layMatchedPrice;
         state.exit_time = Date.now();
         state.exit_reason = 'PROFIT_TARGET';
         
-        const exitAt = new Date().toISOString();
-        await this.settleTradeWithPnl(trade, state, 'WIN', { layPrice: backPrice, layStake });
+        await this.settleTradeWithPnl(trade, state, 'WIN', { layPrice: layMatchedPrice, layStake: actualMatchedSize });
         await this.logEvent(trade.id, 'PROFIT_TARGET_HIT', { 
-          price_entered: entryPrice,
-          price_exited: backPrice,
           entry_price: entryPrice,
-          exit_price: backPrice,
-          profit_pct: priceDropPct,
-          lay_bet_id: layRes.betId,
-          timestamp: exitAt,
+          exit_price: layMatchedPrice,
+          lay_matched_verified: actualMatchedSize,
+          lay_bet_id: layBetId,
+          timestamp: new Date().toISOString(),
         });
+        return;
       }
-      return;
+    } else if (state.lay_failed) {
+      // Lay placement failed earlier - try emergency hedge
+      const backMatched = trade.back_matched_size || trade.back_stake || 0;
+      if (backMatched > 0 && !state.emergency_hedge_attempted) {
+        this.logger.warn(`[strategy:${STRATEGY_KEY}] Retrying hedge for exposed position (£${backMatched})`);
+        state.emergency_hedge_attempted = true;
+        await this.placeEmergencyHedge(trade, state, backMatched, sessionToken, market);
+        return;
+      }
     }
 
     // Check for 2nd goal (30% spike from current stable price)
@@ -808,6 +1079,12 @@ class EplUnder25GoalReactStrategy {
     
     if (spikeFromStable >= goalDetectionPct) {
       this.logger.log(`[strategy:${STRATEGY_KEY}] ⚠️ 2ND GOAL DETECTED! Spike: ${spikeFromStable.toFixed(1)}%`);
+      
+      // Cancel existing lay order before entering stop-loss mode
+      if (layBetId) {
+        this.logger.log(`[strategy:${STRATEGY_KEY}] Cancelling profit lay order ${layBetId} due to 2nd goal`);
+        await this.cancelOrderSafe(layBetId, sessionToken, 'cancel-lay-2nd-goal');
+      }
       
       state.phase = PHASE.STOP_LOSS_WAIT;
       state.second_goal_spike_at = Date.now();
@@ -913,6 +1190,95 @@ class EplUnder25GoalReactStrategy {
     this.logger.log(`[strategy:${STRATEGY_KEY}] STOP_LOSS_ACTIVE: waiting for ${stopLossPct}% drop (current: ${dropFromBaseline.toFixed(1)}%)`);
   }
 
+  // --- Emergency Hedge ---
+
+  /**
+   * Emergency hedge when lay order fails/cancelled and we have back exposure
+   * Places a market lay at current price to close exposure
+   */
+  async placeEmergencyHedge(trade, state, backMatched, sessionToken, market) {
+    const backPrice = state.entry_price || trade.back_price;
+    
+    if (backMatched <= 0) {
+      this.logger.log(`[strategy:${STRATEGY_KEY}] No back exposure - no emergency hedge needed`);
+      return;
+    }
+    
+    const book = await this.getMarketBookSafe(market.marketId, sessionToken, 'emergency-hedge-book');
+    const runner = book?.runners?.find(r => r.selectionId == market.selectionId);
+    const currentLayPrice = runner?.ex?.availableToLay?.[0]?.price;
+    
+    if (!currentLayPrice) {
+      this.logger.error(`[strategy:${STRATEGY_KEY}] ❌ CRITICAL: No lay price for emergency hedge - POSITION FULLY EXPOSED`);
+      await this.updateTrade(trade.id, {
+        last_error: 'EMERGENCY_HEDGE_FAILED_NO_PRICE',
+        state_data: { ...state, emergency_hedge_failed: true },
+      });
+      await this.logEvent(trade.id, 'EMERGENCY_HEDGE_FAILED', {
+        reason: 'NO_LAY_PRICE',
+        back_exposure: backMatched,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+    
+    // Calculate emergency lay stake
+    const { layStake } = calculateLayStake({
+      backStake: backMatched,
+      backPrice,
+      layPrice: currentLayPrice,
+      commission: this.settings?.commission_rate || this.defaults.commission_rate,
+    });
+    
+    this.logger.log(`[strategy:${STRATEGY_KEY}] 🚨 EMERGENCY HEDGE: Laying £${layStake} @ ${currentLayPrice} to cover £${backMatched} back exposure`);
+    
+    const placeRes = await this.placeLimitOrderSafe(
+      market.marketId,
+      market.selectionId,
+      'LAY',
+      layStake,
+      currentLayPrice,
+      sessionToken,
+      'emergency-hedge'
+    );
+    
+    if (placeRes.status === 'SUCCESS') {
+      this.logger.log(`[strategy:${STRATEGY_KEY}] ✓ Emergency hedge placed: ${placeRes.betId}`);
+      
+      state.lay_bet_id = placeRes.betId;
+      state.target_lay_price = currentLayPrice;
+      state.emergency_hedge = true;
+      
+      await this.updateTrade(trade.id, {
+        lay_order_ref: placeRes.betId,
+        lay_price: currentLayPrice,
+        lay_size: layStake,
+        lay_placed_at: new Date().toISOString(),
+        state_data: state,
+        last_error: null,
+      });
+      
+      await this.logEvent(trade.id, 'EMERGENCY_HEDGE_PLACED', {
+        betId: placeRes.betId,
+        lay_price: currentLayPrice,
+        lay_stake: layStake,
+        reason: 'ORIGINAL_LAY_FAILED_OR_CANCELLED',
+        timestamp: new Date().toISOString(),
+      });
+    } else {
+      this.logger.error(`[strategy:${STRATEGY_KEY}] ❌ Emergency hedge FAILED: ${placeRes.errorCode}`);
+      await this.updateTrade(trade.id, {
+        last_error: `EMERGENCY_HEDGE_FAILED: ${placeRes.errorCode}`,
+        state_data: { ...state, emergency_hedge_failed: true },
+      });
+      await this.logEvent(trade.id, 'EMERGENCY_HEDGE_FAILED', {
+        errorCode: placeRes.errorCode,
+        back_exposure: backMatched,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+
   // --- Helpers ---
 
   async ensureMarketForTrade(trade, sessionToken) {
@@ -955,6 +1321,13 @@ class EplUnder25GoalReactStrategy {
     const commission = this.settings?.commission_rate || this.defaults.commission_rate;
     const backStake = trade.back_stake || trade.back_size || 0;
     const backPrice = state.entry_price || trade.back_price || 0;
+    const eventName = trade.event_name || trade.event_id || 'Unknown';
+    
+    // Validation logging
+    this.logger.log(`[strategy:${STRATEGY_KEY}] Settlement calc for ${eventName}:`);
+    this.logger.log(`[strategy:${STRATEGY_KEY}]   Back: £${backStake} @ ${backPrice}`);
+    this.logger.log(`[strategy:${STRATEGY_KEY}]   Lay:  £${layStake || 0} @ ${layPrice || 0}`);
+    this.logger.log(`[strategy:${STRATEGY_KEY}]   Reason: ${reason}`);
     
     const realised = computeRealisedPnlSnapshot({
       backStake,
@@ -964,20 +1337,31 @@ class EplUnder25GoalReactStrategy {
       commission,
     });
 
+    // Handle null P&L (lay not matched)
+    if (realised === null) {
+      this.logger.warn(`[strategy:${STRATEGY_KEY}] ⚠️ Cannot calculate P&L - lay data missing`);
+    }
+
     await this.updateTrade(trade.id, {
       status: 'completed',
       state_data: state,
       lay_price: layPrice || null,
       lay_size: layStake || null,
       lay_matched_size: layStake || null,
-      realised_pnl: realised,
+      realised_pnl: realised,  // May be null
       pnl: realised,
       settled_at: new Date().toISOString(),
       total_stake: backStake + (layStake || 0),
       last_error: reason === 'MARKET_CLOSED' ? reason : null,
     });
 
-    this.logger.log(`[strategy:${STRATEGY_KEY}] Trade settled: ${reason}, P&L: ${realised}`);
+    // Log outcome handling null
+    if (realised !== null) {
+      const outcomeSymbol = realised >= 0 ? '✓ PROFIT' : '✗ LOSS';
+      this.logger.log(`[strategy:${STRATEGY_KEY}] ${outcomeSymbol}: £${realised.toFixed(2)} on ${eventName} (${reason})`);
+    } else {
+      this.logger.log(`[strategy:${STRATEGY_KEY}] Trade settled: ${reason}, P&L: UNKNOWN (incomplete data)`);
+    }
   }
 
   async updateTrade(id, patch) {
