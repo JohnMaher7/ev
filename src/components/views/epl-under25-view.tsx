@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import React, { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight } from "lucide-react";
 
@@ -91,14 +91,38 @@ export default function EplUnder25View() {
   const queryClient = useQueryClient();
   const [statusFilter, setStatusFilter] = useState("");
   const [strategyFilter, setStrategyFilter] = useState("");
+  const [competitionFilter, setCompetitionFilter] = useState("");
+  const [dateFilter, setDateFilter] = useState("");
   const [expandedTrades, setExpandedTrades] = useState<Set<string>>(new Set());
 
+  // Fetch competition names separately
+  const competitionNamesQuery = useQuery({
+    queryKey: ["strategy-trades", "epl-under25", "competition-names"],
+    queryFn: async () => {
+      const params = new URLSearchParams();
+      params.set("get_competition_names", "true");
+      params.set("limit", "1"); // Minimal data needed
+      const res = await fetch(`/api/strategies/epl-under25/trades?${params}`);
+      if (!res.ok) throw new Error("Failed to load competition names");
+      const json = await res.json();
+      if (!json.success) throw new Error(json.error || "Failed to load competition names");
+      return (json.competitionNames || []) as string[];
+    },
+  });
+
   const tradesQuery = useQuery({
-    queryKey: ["strategy-trades", "epl-under25", statusFilter, strategyFilter],
+    queryKey: ["strategy-trades", "epl-under25", statusFilter, strategyFilter, competitionFilter, dateFilter],
     queryFn: async () => {
       const params = new URLSearchParams();
       if (statusFilter) params.set("status", statusFilter);
       if (strategyFilter) params.set("strategy_key", strategyFilter);
+      if (competitionFilter) params.set("competition_name", competitionFilter);
+      if (dateFilter) {
+        // Set date_from to the selected date (start of day)
+        params.set("date_from", new Date(dateFilter).toISOString().split('T')[0] + 'T00:00:00.000Z');
+        // Set date_to to end of the selected day
+        params.set("date_to", new Date(dateFilter).toISOString().split('T')[0] + 'T23:59:59.999Z');
+      }
       const res = await fetch(`/api/strategies/epl-under25/trades?${params}`);
       if (!res.ok) throw new Error("Failed to load trades");
       const json = await res.json();
@@ -140,6 +164,11 @@ export default function EplUnder25View() {
 
   const trades = useMemo(() => tradesQuery.data ?? [], [tradesQuery.data]);
 
+  // Use competition names from the separate query (all competitions, not just loaded trades)
+  const competitionNames = useMemo(() => {
+    return competitionNamesQuery.data ?? [];
+  }, [competitionNamesQuery.data]);
+
   const summary = useMemo(() => {
     return trades.reduce(
       (acc, trade) => {
@@ -150,6 +179,25 @@ export default function EplUnder25View() {
       },
       { totalStaked: 0, totalTrades: 0, pnl: 0 },
     );
+  }, [trades]);
+
+  // Calculate profit by competition
+  const competitionProfits = useMemo(() => {
+    const profitMap = new Map<string, { pnl: number; trades: number; staked: number }>();
+    
+    trades.forEach(trade => {
+      const compName = trade.competition_name || trade.competition || 'Unknown';
+      const existing = profitMap.get(compName) || { pnl: 0, trades: 0, staked: 0 };
+      profitMap.set(compName, {
+        pnl: existing.pnl + getRealisedPnl(trade),
+        trades: existing.trades + 1,
+        staked: existing.staked + getTotalStake(trade),
+      });
+    });
+    
+    return Array.from(profitMap.entries())
+      .map(([name, data]) => ({ name, ...data }))
+      .sort((a, b) => b.pnl - a.pnl); // Sort by profit descending
   }, [trades]);
 
   const error = tradesQuery.error;
@@ -166,12 +214,25 @@ export default function EplUnder25View() {
         <CardContent className="space-y-6">
           <SummaryBar summary={summary} />
 
+          {/* Profit by Competition */}
+          {competitionProfits.length > 0 && (
+            <CompetitionProfitSummary competitions={competitionProfits} />
+          )}
+
           <Filters
             status={statusFilter}
             onStatusChange={setStatusFilter}
             strategy={strategyFilter}
             onStrategyChange={setStrategyFilter}
-            onRefresh={() => queryClient.invalidateQueries({ queryKey: ["strategy-trades", "epl-under25"] })}
+            competition={competitionFilter}
+            onCompetitionChange={setCompetitionFilter}
+            date={dateFilter}
+            onDateChange={setDateFilter}
+            competitionNames={competitionNames}
+            onRefresh={() => {
+              queryClient.invalidateQueries({ queryKey: ["strategy-trades", "epl-under25"] });
+              queryClient.invalidateQueries({ queryKey: ["strategy-trades", "epl-under25", "competition-names"] });
+            }}
             disabled={tradesQuery.isFetching}
           />
 
@@ -225,11 +286,56 @@ function SummaryCard({
   );
 }
 
+function CompetitionProfitSummary({
+  competitions,
+}: {
+  competitions: Array<{ name: string; pnl: number; trades: number; staked: number }>;
+}) {
+  if (competitions.length === 0) return null;
+  
+  return (
+    <div className="space-y-2">
+      <h3 className="text-sm font-medium text-[var(--color-text-muted)]">Profit by Competition</h3>
+      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+        {competitions.map((comp) => (
+          <div
+            key={comp.name}
+            className={cn(
+              "rounded-lg border p-3",
+              comp.pnl >= 0
+                ? "border-[rgba(16,185,129,0.3)] bg-[rgba(16,185,129,0.05)]"
+                : "border-[rgba(239,68,68,0.3)] bg-[rgba(239,68,68,0.05)]"
+            )}
+          >
+            <div className="text-xs text-[var(--color-text-muted)] truncate" title={comp.name}>
+              {comp.name}
+            </div>
+            <div className={cn(
+              "text-lg font-semibold",
+              comp.pnl >= 0 ? "text-[var(--color-positive)]" : "text-[var(--color-negative)]"
+            )}>
+              {formatCurrency(comp.pnl)}
+            </div>
+            <div className="text-xs text-[var(--color-text-muted)]">
+              {comp.trades} trades • {formatCurrency(comp.staked)} staked
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function Filters({
   status,
   onStatusChange,
   strategy,
   onStrategyChange,
+  competition,
+  onCompetitionChange,
+  date,
+  onDateChange,
+  competitionNames,
   onRefresh,
   disabled,
 }: {
@@ -237,12 +343,18 @@ function Filters({
   onStatusChange: (value: string) => void;
   strategy: string;
   onStrategyChange: (value: string) => void;
+  competition: string;
+  onCompetitionChange: (value: string) => void;
+  date: string;
+  onDateChange: (value: string) => void;
+  competitionNames: string[];
   onRefresh: () => void;
   disabled: boolean;
 }) {
   return (
-    <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-      <div className="flex items-center gap-3">
+    <div className="space-y-3">
+      {/* Row 1: Strategy and Status */}
+      <div className="flex flex-wrap items-center gap-3">
         <label className="text-xs text-[var(--color-text-muted)]">Strategy</label>
         <select
           className="rounded-md border border-[var(--color-divider)] bg-transparent px-3 py-2 text-sm"
@@ -268,9 +380,33 @@ function Filters({
           ))}
         </select>
       </div>
-      <Button type="button" variant="ghost" size="sm" onClick={onRefresh} disabled={disabled}>
-        Refresh
-      </Button>
+      
+      {/* Row 2: Competition and Date filters */}
+      <div className="flex flex-wrap items-center gap-3">
+        <label className="text-xs text-[var(--color-text-muted)]">Competition</label>
+        <select
+          className="rounded-md border border-[var(--color-divider)] bg-transparent px-3 py-2 text-sm min-w-[200px]"
+          value={competition}
+          onChange={(event) => onCompetitionChange(event.target.value)}
+        >
+          <option value="">All Competitions</option>
+          {competitionNames.map((name) => (
+            <option key={name} value={name}>
+              {name}
+            </option>
+          ))}
+        </select>
+        <label className="text-xs text-[var(--color-text-muted)]">Date</label>
+        <input
+          type="date"
+          value={date}
+          onChange={(event) => onDateChange(event.target.value)}
+          className="rounded-md border border-[var(--color-divider)] bg-transparent px-3 py-2 text-sm w-[160px]"
+        />
+        <Button type="button" variant="ghost" size="sm" onClick={onRefresh} disabled={disabled}>
+          Refresh
+        </Button>
+      </div>
     </div>
   );
 }
@@ -354,8 +490,8 @@ function TradesTable({
             const isFinalStatus = ['hedged', 'completed', 'cancelled', 'skipped', 'failed'].includes(trade.status);
 
             return (
-              <>
-                <tr key={trade.id} className="bg-[var(--color-card)]/40 cursor-pointer hover:bg-[var(--color-card)]/60" onClick={() => onToggleExpand(trade.id)}>
+              <React.Fragment key={trade.id}>
+                <tr className="bg-[var(--color-card)]/40 cursor-pointer hover:bg-[var(--color-card)]/60" onClick={() => onToggleExpand(trade.id)}>
                   <td className="px-2 py-3 text-center">
                     {isExpanded ? (
                       <ChevronDown className="h-4 w-4 text-[var(--color-text-muted)]" />
@@ -405,7 +541,7 @@ function TradesTable({
                     </td>
                   </tr>
                 )}
-              </>
+              </React.Fragment>
             );
           })}
         </tbody>

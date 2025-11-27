@@ -1695,41 +1695,11 @@ class EplUnder25Strategy {
             const unmatchedAmount = order.sizeRemaining || 0;
             
             if (matchedAmount > 0 && unmatchedAmount > 0) {
-                // PARTIAL MATCH TIMEOUT GUARDRAIL
-                // If partially matched for more than 1 minute, cancel remainder and green-up
-                const backPlacedAt = trade.back_placed_at ? new Date(trade.back_placed_at) : null;
-                const timeSincePlaced = backPlacedAt ? (now.getTime() - backPlacedAt.getTime()) / 1000 : 0;
-                const partialMatchTimeout = 60; // 1 minute
-                
-                if (timeSincePlaced >= partialMatchTimeout) {
-                    this.logger.log(`[strategy:epl_under25] ⏰ PARTIAL MATCH TIMEOUT: £${matchedAmount} matched, £${unmatchedAmount} unmatched after ${timeSincePlaced.toFixed(0)}s`);
-                    this.logger.log(`[strategy:epl_under25] Cancelling unmatched portion and placing lay for matched amount only`);
-                    
-                    // Cancel remaining back order
-                    await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/cancelOrders', {
-                        marketId: trade.betfair_market_id,
-                        instructions: [{ betId: trade.back_order_ref }],
-                    }, 'cancelBack-partial-timeout');
-                    
-                    const matchedPrice = order.averagePriceMatched || order.price;
-                    trade.back_matched_size = matchedAmount;
-                    trade.back_price = matchedPrice;
-                    
-                    await this.logEvent(trade.id, 'PARTIAL_MATCH_TIMEOUT', {
-                        matchedAmount,
-                        unmatchedAmount,
-                        matchedPrice,
-                        seconds_waited: timeSincePlaced,
-                        timestamp: new Date().toISOString(),
-                    });
-                    
-                    // Place lay for matched portion only
-                    await this.placeLayForGreenUp(trade, sessionToken, matchedAmount, matchedPrice);
-                    return;
-                }
-                
-                // Still within timeout - keep waiting
-                this.logger.log(`[strategy:epl_under25] Pre-match partial: £${matchedAmount} of £${trade.back_size} matched (${timeSincePlaced.toFixed(0)}s/${partialMatchTimeout}s timeout), waiting...`);
+                // PARTIAL MATCH - Wait until kickoff, then cancel remainder and green-up
+                // Log progress - will be handled at kickoff
+                const minsToKickoff = (kickoff.getTime() - now.getTime()) / 60000;
+                this.logger.log(`[strategy:epl_under25] Pre-match partial: £${matchedAmount} of £${trade.back_size} matched - waiting for kickoff (${minsToKickoff.toFixed(1)} mins)`);
+                // Will check again on next poll - handled at kickoff in the "now >= kickoff" section below
             } else if (matchedAmount === 0) {
                 // Nothing matched yet - just wait
                 this.logger.log(`[strategy:epl_under25] Pre-match: back order pending, no matches yet`);

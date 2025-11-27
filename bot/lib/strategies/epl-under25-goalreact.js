@@ -625,15 +625,19 @@ class EplUnder25GoalReactStrategy {
       return;
     }
 
-    // Check for goal (30% price spike)
-    const priceChange = ((backPrice - state.baseline_price) / state.baseline_price) * 100;
+    // Check for goal (30% price spike from baseline)
+    const priceChangeFromBaseline = ((backPrice - state.baseline_price) / state.baseline_price) * 100;
     
-    // Diagnostic: Log price vs baseline on each poll
+    // Calculate change from PREVIOUS poll (for logging clarity)
+    const previousPrice = state.last_price || state.baseline_price;
+    const priceChangeFromPrevious = ((backPrice - previousPrice) / previousPrice) * 100;
+    
+    // Diagnostic: Log price vs PREVIOUS poll (easier to monitor)
     const eventName = trade.event_name || trade.event_id || 'Unknown';
-    this.logger.log(`[strategy:${STRATEGY_KEY}]   WATCHING ${eventName}: price=${backPrice} | baseline=${state.baseline_price} | change=${priceChange.toFixed(1)}% | threshold=${goalDetectionPct}%`);
+    this.logger.log(`[strategy:${STRATEGY_KEY}]   WATCHING ${eventName}: price=${backPrice} | prev=${previousPrice} | change=${priceChangeFromPrevious.toFixed(1)}% | vs_baseline=${priceChangeFromBaseline.toFixed(1)}% | threshold=${goalDetectionPct}%`);
     
-    if (priceChange >= goalDetectionPct) {
-      this.logger.log(`[strategy:${STRATEGY_KEY}] 🎯 GOAL DETECTED! Price spike: ${priceChange.toFixed(1)}% (${state.baseline_price} → ${backPrice})`);
+    if (priceChangeFromBaseline >= goalDetectionPct) {
+      this.logger.log(`[strategy:${STRATEGY_KEY}] 🎯 GOAL DETECTED! Price spike: ${priceChangeFromBaseline.toFixed(1)}% from baseline (${state.baseline_price} → ${backPrice})`);
       
       // Check if goal is after cutoff
       if (minsFromKickoff > goalCutoff) {
@@ -670,7 +674,7 @@ class EplUnder25GoalReactStrategy {
         price_after_goal: backPrice,
         spike_price: backPrice,
         baseline_price: state.baseline_price,
-        price_change_pct: priceChange,
+        price_change_pct: priceChangeFromBaseline,
         mins_from_kickoff: minsFromKickoff,
         timestamp: goalDetectedAt,
       });
@@ -779,7 +783,7 @@ class EplUnder25GoalReactStrategy {
    * Handles: suspensions, partial matches, cancellations
    */
   async waitAndVerifyBackThenPlaceLay(trade, state, backBetId, stake, entryPrice, sessionToken, market) {
-    const maxWaitMs = 5000; // Wait up to 5 seconds for back to match
+    const maxWaitMs = 15000; // Wait up to 15 seconds for back to match
     const pollIntervalMs = 500;
     let elapsed = 0;
     let backMatchedSize = 0;
@@ -855,28 +859,95 @@ class EplUnder25GoalReactStrategy {
       }
     }
     
-    // If STILL nothing matched, cancel and skip
+    // If STILL nothing matched, cancel old order and place NEW back at current price
     if (backMatchedSize === 0) {
-      this.logger.warn(`[strategy:${STRATEGY_KEY}] ⚠️ Back did NOT match after ${elapsed}ms - cancelling and skipping`);
+      this.logger.warn(`[strategy:${STRATEGY_KEY}] ⚠️ Back did NOT match after ${elapsed}ms - cancelling and REPLACING at current price`);
       
-      await this.cancelOrderSafe(backBetId, sessionToken, 'cancel-unmatched-back');
+      // Try to cancel old order (may fail if already cancelled - that's ok)
+      try {
+        await this.cancelOrderSafe(backBetId, sessionToken, 'cancel-unmatched-back');
+      } catch (cancelErr) {
+        this.logger.warn(`[strategy:${STRATEGY_KEY}] Cancel failed (order may already be gone): ${cancelErr.message}`);
+      }
       
-      state.phase = PHASE.SKIPPED;
-      await this.updateTrade(trade.id, {
-        status: 'skipped',
-        state_data: state,
-        back_order_ref: backBetId,
-        back_matched_size: 0,
-        last_error: 'BACK_NOT_MATCHED_NO_LIQUIDITY',
-      });
+      // Get current market back price
+      const book = await this.getMarketBookSafe(market.marketId, sessionToken, 'get-new-back-price');
+      const runner = book?.runners?.find(r => r.selectionId == market.selectionId);
+      const currentBackPrice = runner?.ex?.availableToBack?.[0]?.price;
       
-      await this.logEvent(trade.id, 'BACK_NOT_MATCHED', {
-        betId: backBetId,
-        reason: 'No matches after timeout - no lay placed, no exposure',
-        waited_ms: elapsed,
-        timestamp: new Date().toISOString(),
-      });
-      return;
+      if (!currentBackPrice) {
+        this.logger.error(`[strategy:${STRATEGY_KEY}] No back price available - cannot replace order, skipping`);
+        state.phase = PHASE.SKIPPED;
+        await this.updateTrade(trade.id, {
+          status: 'skipped',
+          state_data: state,
+          last_error: 'BACK_REPLACE_FAILED_NO_PRICE',
+        });
+        await this.logEvent(trade.id, 'BACK_REPLACE_FAILED', {
+          reason: 'No back price available',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+      
+      this.logger.log(`[strategy:${STRATEGY_KEY}] Placing NEW back order @ current price ${currentBackPrice}`);
+      
+      // Place new back at current price
+      const newBackRes = await this.placeLimitOrderSafe(
+        market.marketId,
+        market.selectionId,
+        'BACK',
+        stake,
+        currentBackPrice,
+        sessionToken,
+        'goalreact-entry-retry'
+      );
+      
+      if (newBackRes.status === 'SUCCESS') {
+        this.logger.log(`[strategy:${STRATEGY_KEY}] ✓ NEW BACK PLACED @ ${currentBackPrice} - betId: ${newBackRes.betId}`);
+        
+        state.entry_price = currentBackPrice;
+        state.entry_time = Date.now();
+        state.back_bet_id = newBackRes.betId;
+        state.back_retry_count = (state.back_retry_count || 0) + 1;
+        
+        await this.logEvent(trade.id, 'BACK_REPLACED', {
+          old_bet_id: backBetId,
+          new_bet_id: newBackRes.betId,
+          new_price: currentBackPrice,
+          old_price: entryPrice,
+          retry_count: state.back_retry_count,
+          timestamp: new Date().toISOString(),
+        });
+        
+        // Recursively verify this new order (with retry limit)
+        if (state.back_retry_count <= 3) {
+          await this.waitAndVerifyBackThenPlaceLay(trade, state, newBackRes.betId, stake, currentBackPrice, sessionToken, market);
+        } else {
+          this.logger.error(`[strategy:${STRATEGY_KEY}] Max back retries (3) reached - giving up`);
+          state.phase = PHASE.SKIPPED;
+          await this.updateTrade(trade.id, {
+            status: 'skipped',
+            state_data: state,
+            last_error: 'MAX_BACK_RETRIES_REACHED',
+          });
+        }
+        return;
+      } else {
+        this.logger.error(`[strategy:${STRATEGY_KEY}] New back order failed: ${newBackRes.errorCode}`);
+        state.phase = PHASE.SKIPPED;
+        await this.updateTrade(trade.id, {
+          status: 'skipped',
+          state_data: state,
+          last_error: `BACK_REPLACE_FAILED: ${newBackRes.errorCode}`,
+        });
+        await this.logEvent(trade.id, 'BACK_REPLACE_FAILED', {
+          errorCode: newBackRes.errorCode,
+          attempted_price: currentBackPrice,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
     }
     
     // Back matched (fully or partially) - NOW place lay

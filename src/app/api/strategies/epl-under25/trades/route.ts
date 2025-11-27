@@ -110,29 +110,76 @@ function demoTrades() {
 
 export async function GET(request: NextRequest) {
   try {
-    if (config.demoMode || !supabaseAdmin) {
-      return NextResponse.json({ success: true, data: demoTrades(), cursor: null });
-    }
-
     const { searchParams } = new URL(request.url);
     const status = searchParams.get('status');
     const strategyKey = searchParams.get('strategy_key'); // Filter by specific strategy
+    const competitionName = searchParams.get('competition_name');
+    const dateFrom = searchParams.get('date_from');
+    const dateTo = searchParams.get('date_to');
     const cursor = searchParams.get('cursor');
-    const limit = parseInt(searchParams.get('limit') || '50', 10);
+    // Increase limit when no filters are applied (to show all trades)
+    const hasFilters = !!(status || strategyKey || competitionName || dateFrom || dateTo);
+    const defaultLimit = hasFilters ? 50 : 1000; // Show more when no filters
+    const limit = parseInt(searchParams.get('limit') || String(defaultLimit), 10);
+
+    // If requesting competition names, handle it early
+    const getCompetitionNames = searchParams.get('get_competition_names') === 'true';
+    if (getCompetitionNames && (config.demoMode || !supabaseAdmin)) {
+      const demoCompetitions = ['English Premier League'];
+      return NextResponse.json({ success: true, data: [], cursor: null, competitionNames: demoCompetitions });
+    }
+
+    if (config.demoMode || !supabaseAdmin) {
+      let demoData = demoTrades();
+      
+      // Apply filters to demo data
+      if (status) {
+        demoData = demoData.filter(t => t.status === status);
+      }
+      if (strategyKey) {
+        demoData = demoData.filter(t => t.strategy_key === strategyKey);
+      }
+      if (competitionName) {
+        demoData = demoData.filter(t => t.competition_name === competitionName);
+      }
+      if (dateFrom) {
+        demoData = demoData.filter(t => t.kickoff_at && t.kickoff_at >= dateFrom);
+      }
+      if (dateTo) {
+        demoData = demoData.filter(t => t.kickoff_at && t.kickoff_at <= dateTo);
+      }
+      
+      // Sort by kickoff_at descending (most recent first)
+      demoData.sort((a, b) => {
+        const aTime = a.kickoff_at ? new Date(a.kickoff_at).getTime() : 0;
+        const bTime = b.kickoff_at ? new Date(b.kickoff_at).getTime() : 0;
+        return bTime - aTime;
+      });
+      
+      return NextResponse.json({ success: true, data: demoData, cursor: null });
+    }
 
     let query = supabaseAdmin
       .from('strategy_trades')
       .select('*')
       .in('strategy_key', strategyKey ? [strategyKey] : STRATEGY_KEYS)
-      .order('kickoff_at', { ascending: true })
+      .order('kickoff_at', { ascending: false })
       .limit(limit);
 
     if (status) {
       query = query.eq('status', status);
     }
 
+    if (dateFrom) {
+      query = query.gte('kickoff_at', dateFrom);
+    }
+
+    if (dateTo) {
+      query = query.lte('kickoff_at', dateTo);
+    }
+
     if (cursor) {
-      query = query.gt('kickoff_at', cursor);
+      query = query.lt('kickoff_at', cursor);
     }
 
     const { data, error } = await query;
@@ -176,7 +223,47 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    const nextCursor = data && data.length === limit ? data[data.length - 1]?.kickoff_at ?? null : null;
+    // Filter by competition_name after enrichment (since it's enriched from fixtures)
+    if (competitionName && enrichedData) {
+      enrichedData = enrichedData.filter((trade) => trade.competition_name === competitionName);
+    }
+
+    // For descending order, cursor should be the last item's kickoff_at
+    const nextCursor = enrichedData && enrichedData.length === limit && enrichedData.length > 0 
+      ? enrichedData[enrichedData.length - 1]?.kickoff_at ?? null 
+      : null;
+
+    // If requesting competition names, fetch all unique competition names
+    if (getCompetitionNames) {
+      // Fetch unique competition names from both strategy_fixtures and strategy_trades
+      const [fixturesResult, tradesResult] = await Promise.all([
+        supabaseAdmin
+          .from('strategy_fixtures')
+          .select('competition')
+          .in('strategy_key', STRATEGY_KEYS)
+          .not('competition', 'is', null),
+        supabaseAdmin
+          .from('strategy_trades')
+          .select('competition_name')
+          .in('strategy_key', STRATEGY_KEYS)
+          .not('competition_name', 'is', null)
+      ]);
+
+      const competitions = new Set<string>();
+      if (fixturesResult.data) {
+        fixturesResult.data.forEach(f => {
+          if (f.competition) competitions.add(f.competition);
+        });
+      }
+      if (tradesResult.data) {
+        tradesResult.data.forEach(t => {
+          if (t.competition_name) competitions.add(t.competition_name);
+        });
+      }
+
+      const uniqueCompetitions = Array.from(competitions).sort();
+      return NextResponse.json({ success: true, data: enrichedData, cursor: nextCursor, competitionNames: uniqueCompetitions });
+    }
 
     return NextResponse.json({ success: true, data: enrichedData, cursor: nextCursor });
   } catch (error) {
