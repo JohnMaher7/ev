@@ -205,7 +205,13 @@ export async function GET(request: NextRequest) {
 
           enrichedData = data.map((trade) => {
             const fixture = fixtureMap.get(`${trade.strategy_key}-${trade.betfair_event_id}`);
-            const competitionName = trade.competition_name || fixture?.competition || 'English Premier League';
+            const tradeCompetition = trade.competition_name;
+            const isPlaceholderCompetition =
+              !tradeCompetition || tradeCompetition === 'Multiple Leagues' || tradeCompetition === 'Unknown';
+            const competitionName =
+              (isPlaceholderCompetition ? fixture?.competition : tradeCompetition) ||
+              fixture?.competition ||
+              'English Premier League';
             const eventName =
               trade.event_name ||
               (fixture?.home && fixture?.away ? `${fixture.home} v ${fixture.away}` : null);

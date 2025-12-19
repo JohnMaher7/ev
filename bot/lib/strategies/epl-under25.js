@@ -736,6 +736,7 @@ class EplUnder25Strategy {
             else if (id === '81') competitionIdToName.set(id, 'Italian Serie A');
             else if (id === '228') competitionIdToName.set(id, 'UEFA Champions League');
             else if (id === '2005') competitionIdToName.set(id, 'UEFA Europa League');
+            else if (id === '2134') competitionIdToName.set(id, 'English Football League Cup');
           }
         });
       }

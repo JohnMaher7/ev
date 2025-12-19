@@ -1,4 +1,24 @@
-<!-- b5058e5a-9d08-4aef-9827-9b0f032d9bdf cef475ad-24bc-45db-ad0a-c8401b3a3169 -->
+---
+name: Fix Discovery/Poll Disconnect - Surgical Diagnosis
+overview: ""
+todos:
+  - id: 86eb3385-f200-4e26-89c6-80fac6aada77
+    content: Create simple toast notification component and context
+    status: pending
+  - id: 4916f4e8-0eef-410f-8bba-55b8e27abd50
+    content: Add toast notifications to discovery and poll mutations in admin view
+    status: pending
+  - id: 4c94fe72-c568-46ea-9aa5-c04a41cde8fc
+    content: Enhance response messages in poll and discovery routes
+    status: pending
+  - id: ce79e471-6b24-4078-9798-d7f4cda8e2b8
+    content: Add console.log statements to track execution in Vercel logs
+    status: pending
+  - id: c3f7d656-c4b7-410b-9009-1afb8845788c
+    content: Test Discovery → Poll sequence and verify toasts show correctly
+    status: pending
+---
+
 # Fix Discovery/Poll Disconnect - Surgical Diagnosis
 
 ## Critical Issues Found
@@ -122,11 +142,3 @@ if (!oddsApiClient) {
 4. Conditional API client (consistent pattern)
 
 These 4 changes will reveal EXACTLY where the break is.
-
-### To-dos
-
-- [ ] Create simple toast notification component and context
-- [ ] Add toast notifications to discovery and poll mutations in admin view
-- [ ] Enhance response messages in poll and discovery routes
-- [ ] Add console.log statements to track execution in Vercel logs
-- [ ] Test Discovery → Poll sequence and verify toasts show correctly

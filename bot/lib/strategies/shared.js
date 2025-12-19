@@ -18,6 +18,7 @@ const COMPETITION_MATCHERS = [
   /^Italian Serie A$/i,          // Serie A
   /^UEFA Champions League$/i,    // Champions League
   /^UEFA Europa League$/i,  // UEFA Europa League
+  /^English Football League Cup$/i,  // English Football League Cup
 ];
 
 // Competition IDs from Betfair
@@ -28,6 +29,7 @@ const COMPETITION_IDS = [
   '81',        // Italian Serie A
   '228',       //UEFA Champions League
   '2005',      // UEFA Europa League
+  '2134',      // English Football League Cup
 ];
 
 // --- Stake/Price Calculations ---

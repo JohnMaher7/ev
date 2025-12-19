@@ -44,23 +44,25 @@ const STRATEGY_KEY = 'epl_under25_goalreact';
 function getDefaultSettings() {
   return {
     // Entry Rules
-    default_stake: parseFloat(process.env.GOALREACT_DEFAULT_STAKE || '100'),
-    wait_after_goal_seconds: parseInt(process.env.GOALREACT_WAIT_AFTER_GOAL || '90', 10),
-    goal_cutoff_minutes: parseInt(process.env.GOALREACT_GOAL_CUTOFF || '45', 10),
-    min_entry_price: parseFloat(process.env.GOALREACT_MIN_ENTRY_PRICE || '2.5'),
-    max_entry_price: parseFloat(process.env.GOALREACT_MAX_ENTRY_PRICE || '5.0'),
-    goal_detection_pct: parseFloat(process.env.GOALREACT_GOAL_DETECTION_PCT || '30'),
+    // Code is the source of truth for this strategy's settings.
+    // (Avoid env overrides here to prevent accidental config drift / Supabase "reverts".)
+    default_stake: 200,
+    wait_after_goal_seconds: 90,
+    goal_cutoff_minutes: 45,
+    min_entry_price: 2.0,
+    max_entry_price: 5.5,
+    goal_detection_pct: 30,
     
     // Exit Rules
-    profit_target_pct: parseFloat(process.env.GOALREACT_PROFIT_TARGET_PCT || '10'),
-    stop_loss_pct: parseFloat(process.env.GOALREACT_STOP_LOSS_PCT || '15'),
+    profit_target_pct: 10,
+    stop_loss_pct: 15,
     
     // Polling
-    in_play_poll_interval_seconds: parseInt(process.env.GOALREACT_POLL_INTERVAL || '30', 10),
+    in_play_poll_interval_seconds: 30,
     
     // General
-    fixture_lookahead_days: parseInt(process.env.GOALREACT_FIXTURE_LOOKAHEAD_DAYS || '7', 10),
-    commission_rate: parseFloat(process.env.GOALREACT_COMMISSION_RATE || '0.0175'),
+    fixture_lookahead_days: 7,
+    commission_rate: 0.0175,
   };
 }
 
@@ -317,7 +319,65 @@ class EplUnder25GoalReactStrategy {
       if (insertErr) throw insertErr;
       this.settings = { ...created, ...created.extra };
     } else {
-      this.settings = { ...data, ...data.extra };
+      // Merge top-level and extra fields (extra takes precedence)
+      this.settings = { ...data, ...(data.extra || {}) };
+
+      // Code/env defaults are the source of truth: auto-sync to database (one-way).
+      const updates = {};
+      const extraUpdates = {};
+      let needsUpdate = false;
+
+      // Top-level columns
+      if (this.settings.default_stake !== this.defaults.default_stake) {
+        this.logger.log(`[strategy:${STRATEGY_KEY}] Syncing default_stake: ${this.settings.default_stake} → ${this.defaults.default_stake} (from env/code defaults)`);
+        updates.default_stake = this.defaults.default_stake;
+        needsUpdate = true;
+      }
+      if (this.settings.fixture_lookahead_days !== this.defaults.fixture_lookahead_days) {
+        updates.fixture_lookahead_days = this.defaults.fixture_lookahead_days;
+        needsUpdate = true;
+      }
+      if (this.settings.commission_rate !== this.defaults.commission_rate) {
+        updates.commission_rate = this.defaults.commission_rate;
+        needsUpdate = true;
+      }
+
+      // Strategy-specific settings in `extra` JSON
+      const extraKeys = [
+        'wait_after_goal_seconds',
+        'goal_cutoff_minutes',
+        'min_entry_price',
+        'max_entry_price',
+        'goal_detection_pct',
+        'profit_target_pct',
+        'stop_loss_pct',
+        'in_play_poll_interval_seconds',
+      ];
+
+      for (const k of extraKeys) {
+        if (this.settings[k] !== this.defaults[k]) {
+          extraUpdates[k] = this.defaults[k];
+          needsUpdate = true;
+        }
+      }
+
+      if (needsUpdate) {
+        if (Object.keys(extraUpdates).length > 0) {
+          const currentExtra = data.extra || {};
+          updates.extra = { ...currentExtra, ...extraUpdates };
+        }
+
+        await this.supabase
+          .from('strategy_settings')
+          .update(updates)
+          .eq('strategy_key', STRATEGY_KEY);
+
+        // Update local settings too
+        Object.assign(this.settings, updates);
+        if (updates.extra) {
+          Object.assign(this.settings, updates.extra);
+        }
+      }
     }
   }
 
@@ -344,12 +404,35 @@ class EplUnder25GoalReactStrategy {
       const matchedCompetitions = (competitionsRes || [])
         .filter((c) => COMPETITION_MATCHERS.some((rx) => rx.test(c.competition?.name || '')));
 
-      let competitionIds = matchedCompetitions.map((c) => c.competition?.id).filter(Boolean);
+      const matchedCompetitionIds = matchedCompetitions.map((c) => c.competition?.id).filter(Boolean);
+
+      // Build competition ID -> name map for later use (and safe fallbacks)
+      const competitionIdToName = new Map();
+      matchedCompetitions.forEach((c) => {
+        if (c.competition?.id && c.competition?.name) {
+          competitionIdToName.set(String(c.competition.id), c.competition.name);
+        }
+      });
+
+      // Use matched IDs, fallback to hardcoded competition IDs if no regex match
+      let competitionIds = matchedCompetitionIds;
       if (competitionIds.length === 0) {
         competitionIds = COMPETITION_IDS;
+
+        // Add hardcoded names for fallback (keeps data correct even if listCompetitions regex fails)
+        competitionIds.forEach((id) => {
+          if (competitionIdToName.has(id)) return;
+          if (id === '10932509') competitionIdToName.set(id, 'English Premier League');
+          else if (id === '59') competitionIdToName.set(id, 'German Bundesliga');
+          else if (id === '117') competitionIdToName.set(id, 'Spanish La Liga');
+          else if (id === '81') competitionIdToName.set(id, 'Italian Serie A');
+          else if (id === '228') competitionIdToName.set(id, 'UEFA Champions League');
+          else if (id === '2005') competitionIdToName.set(id, 'UEFA Europa League');
+          else if (id === '2134') competitionIdToName.set(id, 'English Football League Cup');
+        });
       }
 
-      // Get events
+      // Get events (scoped to competitionIds)
       const eventsRes = await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/listEvents', {
         filter: {
           eventTypeIds: [SOCCER_EVENT_TYPE_ID],
@@ -362,30 +445,61 @@ class EplUnder25GoalReactStrategy {
         maxResults: 100,
       }, 'listEvents');
 
+      // listEvents does not include competition, so fetch it from market catalogues
+      const eventIds = (eventsRes || []).map((evt) => evt.event?.id).filter(Boolean);
+      const eventIdToCompetition = new Map();
+
+      if (eventIds.length > 0) {
+        try {
+          const marketCatalogues = await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/listMarketCatalogue', {
+            filter: {
+              eventIds,
+              marketTypeCodes: ['OVER_UNDER_25'],
+            },
+            maxResults: 1000,
+            marketProjection: ['EVENT', 'COMPETITION'],
+          }, 'listMarketCatalogue-competition');
+
+          (marketCatalogues || []).forEach((market) => {
+            const evtId = market.event?.id;
+            const compId = market.competition?.id;
+            const compName = market.competition?.name;
+            if (evtId && compId && compName) {
+              eventIdToCompetition.set(evtId, competitionIdToName.get(String(compId)) || compName);
+            }
+          });
+        } catch (err) {
+          this.logger.warn(`[strategy:${STRATEGY_KEY}] Failed to fetch competition info from markets: ${err.message}`);
+        }
+      }
+
       this.logger.log(`[strategy:${STRATEGY_KEY}] Fixtures sync found ${eventsRes?.length || 0} events`);
 
-      // Build competition name map
-      const competitionIdToName = new Map();
-      matchedCompetitions.forEach(c => {
-        if (c.competition?.id && c.competition?.name) {
-          competitionIdToName.set(String(c.competition.id), c.competition.name);
-        }
-      });
+      const fixtures = (eventsRes || [])
+        .map((evt) => {
+          const eventId = evt.event?.id;
+          const eventName = evt.event?.name || '';
+          const parts = eventName.split(' v ');
 
-      const fixtures = (eventsRes || []).map((evt) => {
-        const eventName = evt.event?.name || '';
-        const parts = eventName.split(' v ');
-        return {
-          strategy_key: STRATEGY_KEY,
-          betfair_event_id: evt.event?.id,
-          event_id: evt.event?.id,
-          competition: 'Multiple Leagues',
-          home: parts[0]?.trim() || null,
-          away: parts[1]?.trim() || null,
-          kickoff_at: evt.event?.openDate,
-          metadata: evt,
-        };
-      }).filter(f => f.betfair_event_id);
+          // Prefer market-derived competition name (avoids Betfair placeholder like "Multiple Leagues")
+          let competitionName = eventId ? eventIdToCompetition.get(eventId) : null;
+          if (!competitionName) {
+            // Fallback: if only one competition is in-scope, use it; otherwise keep generic
+            competitionName = competitionIdToName.size === 1 ? Array.from(competitionIdToName.values())[0] : 'Multiple Leagues';
+          }
+
+          return {
+            strategy_key: STRATEGY_KEY,
+            betfair_event_id: eventId,
+            event_id: eventId,
+            competition: competitionName,
+            home: parts[0]?.trim() || null,
+            away: parts[1]?.trim() || null,
+            kickoff_at: evt.event?.openDate,
+            metadata: evt,
+          };
+        })
+        .filter((f) => f.betfair_event_id);
 
       if (fixtures.length > 0) {
         const { error: upsertErr } = await this.supabase
@@ -407,17 +521,38 @@ class EplUnder25GoalReactStrategy {
   }
 
   async ensureTradeRecord(fixture) {
+    const competitionName = fixture.competition || 'Unknown';
+    const eventName = formatFixtureName(fixture.home, fixture.away, fixture.event_id);
+
     const { data: existing } = await this.supabase
       .from('strategy_trades')
-      .select('id, status')
+      .select('id, status, competition_name, event_name')
       .eq('strategy_key', STRATEGY_KEY)
       .eq('betfair_event_id', fixture.betfair_event_id)
       .maybeSingle();
     
-    if (existing) return existing.id;
+    if (existing) {
+      // Fix legacy placeholder competition names ("Multiple Leagues") by syncing from fixtures
+      const existingCompetition = existing.competition_name;
+      const shouldFixCompetition =
+        (!existingCompetition || existingCompetition === 'Multiple Leagues' || existingCompetition === 'Unknown') &&
+        competitionName &&
+        competitionName !== 'Multiple Leagues' &&
+        competitionName !== 'Unknown';
 
-    const competitionName = fixture.competition || 'Unknown';
-    const eventName = formatFixtureName(fixture.home, fixture.away, fixture.event_id);
+      const shouldFixEventName =
+        (!existing.event_name || existing.event_name === fixture.event_id || existing.event_name === fixture.betfair_event_id) &&
+        !!eventName;
+
+      if (shouldFixCompetition || shouldFixEventName) {
+        const patch = {};
+        if (shouldFixCompetition) patch.competition_name = competitionName;
+        if (shouldFixEventName) patch.event_name = eventName;
+        await this.updateTrade(existing.id, patch);
+      }
+
+      return existing.id;
+    }
 
     const insert = {
       strategy_key: STRATEGY_KEY,
@@ -739,14 +874,21 @@ class EplUnder25GoalReactStrategy {
       return;
     }
 
-    // Check spread (lay should be within 1 tick of back)
-    if (!isWithinTicks(backPrice, layPrice, 1)) {
-      // Use middle price if spread is wider
-      this.logger.log(`[strategy:${STRATEGY_KEY}] Wide spread detected (back: ${backPrice}, lay: ${layPrice}) - using middle price`);
+    // GUARDRAIL: Check spread before placing back
+    // Only place at back price if lay is within 1 tick (tight spread = good liquidity)
+    const isTightSpread = isWithinTicks(backPrice, layPrice, 1);
+    let entryPrice;
+    
+    if (isTightSpread) {
+      // Tight spread - place at back price for better value
+      entryPrice = backPrice;
+      this.logger.log(`[strategy:${STRATEGY_KEY}] Tight spread (back: ${backPrice}, lay: ${layPrice}) - placing BACK @ back price ${entryPrice}`);
+    } else {
+      // Wide spread - use middle price to improve fill probability
+      entryPrice = getMiddlePrice(backPrice, layPrice);
+      this.logger.log(`[strategy:${STRATEGY_KEY}] Wide spread (back: ${backPrice}, lay: ${layPrice}) - placing BACK @ middle price ${entryPrice}`);
     }
-
-    // Determine entry price
-    const entryPrice = isWithinTicks(backPrice, layPrice, 1) ? layPrice : getMiddlePrice(backPrice, layPrice);
+    
     const stake = trade.target_stake || this.settings?.default_stake || this.defaults.default_stake;
 
     // Place BACK order
@@ -781,46 +923,60 @@ class EplUnder25GoalReactStrategy {
   /**
    * CRITICAL: Verify back order matched before placing lay
    * Handles: suspensions, partial matches, cancellations
+   * 
+   * NEW LOGIC (v2):
+   * - Wait 30s for back to match (up from 15s)
+   * - If any unmatched portion after 30s: cancel unmatched first, then re-bet
+   * - Re-bet only the unmatched amount at current back price
+   * - GUARDRAIL: Only place at back price if lay is within 1 tick (tight spread)
    */
   async waitAndVerifyBackThenPlaceLay(trade, state, backBetId, stake, entryPrice, sessionToken, market) {
-    const maxWaitMs = 15000; // Wait up to 15 seconds for back to match
+    const maxWaitMs = 30000; // Wait up to 30 seconds for back to match
     const pollIntervalMs = 500;
     let elapsed = 0;
     let backMatchedSize = 0;
     let backMatchedPrice = entryPrice;
+    let backRemainingSize = stake;
+    let orderStatus = null;
     
-    this.logger.log(`[strategy:${STRATEGY_KEY}] Verifying back order ${backBetId} matches before placing lay...`);
+    this.logger.log(`[strategy:${STRATEGY_KEY}] Verifying back order ${backBetId} matches before placing lay (30s timeout)...`);
     
+    // Poll for up to 30s to check if back order matches
     while (elapsed < maxWaitMs) {
       const orderDetails = await this.getOrderDetailsSafe(backBetId, sessionToken, 'verify-back-match');
       
       if (!orderDetails) {
-        // Order not found - might be matched and cleared, or cancelled
-        this.logger.warn(`[strategy:${STRATEGY_KEY}] Back order not found after ${elapsed}ms - checking if matched...`);
-        break;
+        // Order not found - might be matched and cleared, or cancelled due to suspension
+        this.logger.warn(`[strategy:${STRATEGY_KEY}] Back order ${backBetId} not found after ${elapsed}ms`);
+        
+        // SAFE: Order disappeared, likely cancelled - no exposure
+        state.phase = PHASE.SKIPPED;
+        await this.updateTrade(trade.id, {
+          status: 'skipped',
+          state_data: state,
+          back_order_ref: backBetId,
+          back_matched_size: 0,
+          last_error: 'BACK_NOT_MATCHED_ORDER_DISAPPEARED',
+        });
+        
+        await this.logEvent(trade.id, 'BACK_NOT_MATCHED', {
+          betId: backBetId,
+          reason: 'Order not found - likely cancelled due to market suspension',
+          elapsed_ms: elapsed,
+          timestamp: new Date().toISOString(),
+        });
+        return;
       }
       
-      if (orderDetails.status === 'EXECUTION_COMPLETE') {
-        // Fully matched
-        backMatchedSize = orderDetails.sizeMatched || stake;
-        backMatchedPrice = orderDetails.averagePriceMatched || entryPrice;
+      orderStatus = orderDetails.status;
+      backMatchedSize = orderDetails.sizeMatched || 0;
+      backRemainingSize = orderDetails.sizeRemaining || 0;
+      backMatchedPrice = orderDetails.averagePriceMatched || entryPrice;
+      
+      if (orderStatus === 'EXECUTION_COMPLETE') {
+        // Fully matched - exit loop
         this.logger.log(`[strategy:${STRATEGY_KEY}] ✓ Back FULLY MATCHED: £${backMatchedSize} @ ${backMatchedPrice}`);
         break;
-      }
-      
-      if (orderDetails.sizeMatched > 0) {
-        // Partially matched
-        backMatchedSize = orderDetails.sizeMatched;
-        backMatchedPrice = orderDetails.averagePriceMatched || entryPrice;
-        
-        // If more than 50% matched, proceed with what we have
-        if (backMatchedSize >= stake * 0.5) {
-          this.logger.log(`[strategy:${STRATEGY_KEY}] Back ${(backMatchedSize / stake * 100).toFixed(0)}% matched (£${backMatchedSize}) - proceeding with matched portion`);
-          
-          // Cancel remaining
-          await this.cancelOrderSafe(backBetId, sessionToken, 'cancel-unmatched-back');
-          break;
-        }
       }
       
       // Wait and retry
@@ -828,129 +984,127 @@ class EplUnder25GoalReactStrategy {
       elapsed += pollIntervalMs;
     }
     
-    // Final check if nothing matched in loop
-    if (backMatchedSize === 0) {
-      const finalCheck = await this.getOrderDetailsSafe(backBetId, sessionToken, 'final-back-check');
+    // After 30s: Handle any unmatched portion
+    if (backRemainingSize > 0 && orderStatus !== 'EXECUTION_COMPLETE') {
+      this.logger.log(`[strategy:${STRATEGY_KEY}] ⚠️ Back partially matched after ${maxWaitMs/1000}s: £${backMatchedSize} matched, £${backRemainingSize} unmatched`);
       
-      if (finalCheck && finalCheck.sizeMatched > 0) {
-        backMatchedSize = finalCheck.sizeMatched;
-        backMatchedPrice = finalCheck.averagePriceMatched || entryPrice;
-      } else if (!finalCheck) {
-        // Order disappeared - might be matched and cleared
-        // Check if it was a successful execution
-        this.logger.warn(`[strategy:${STRATEGY_KEY}] Back order disappeared - assuming cancelled (market suspension?)`);
-        
-        // SAFE: Don't place lay - no exposure
-        state.phase = PHASE.SKIPPED;
-        await this.updateTrade(trade.id, {
-          status: 'skipped',
-          state_data: state,
-          back_order_ref: backBetId,
-          back_matched_size: 0,
-          last_error: 'BACK_NOT_MATCHED_SUSPENSION',
-        });
-        
-        await this.logEvent(trade.id, 'BACK_NOT_MATCHED', {
-          betId: backBetId,
-          reason: 'Order not found - likely cancelled due to market suspension',
-          timestamp: new Date().toISOString(),
-        });
-        return;
-      }
-    }
-    
-    // If STILL nothing matched, cancel old order and place NEW back at current price
-    if (backMatchedSize === 0) {
-      this.logger.warn(`[strategy:${STRATEGY_KEY}] ⚠️ Back did NOT match after ${elapsed}ms - cancelling and REPLACING at current price`);
+      // STEP 1: Cancel unmatched portion FIRST (before placing retry)
+      this.logger.log(`[strategy:${STRATEGY_KEY}] Cancelling unmatched back portion (£${backRemainingSize})...`);
+      await this.cancelOrderSafe(backBetId, sessionToken, 'cancel-unmatched-back');
       
-      // Try to cancel old order (may fail if already cancelled - that's ok)
-      try {
-        await this.cancelOrderSafe(backBetId, sessionToken, 'cancel-unmatched-back');
-      } catch (cancelErr) {
-        this.logger.warn(`[strategy:${STRATEGY_KEY}] Cancel failed (order may already be gone): ${cancelErr.message}`);
-      }
-      
-      // Get current market back price
-      const book = await this.getMarketBookSafe(market.marketId, sessionToken, 'get-new-back-price');
+      // STEP 2: Get current market prices for retry
+      const book = await this.getMarketBookSafe(market.marketId, sessionToken, 'get-retry-back-price');
       const runner = book?.runners?.find(r => r.selectionId == market.selectionId);
       const currentBackPrice = runner?.ex?.availableToBack?.[0]?.price;
+      const currentLayPrice = runner?.ex?.availableToLay?.[0]?.price;
       
       if (!currentBackPrice) {
-        this.logger.error(`[strategy:${STRATEGY_KEY}] No back price available - cannot replace order, skipping`);
-        state.phase = PHASE.SKIPPED;
-        await this.updateTrade(trade.id, {
-          status: 'skipped',
-          state_data: state,
-          last_error: 'BACK_REPLACE_FAILED_NO_PRICE',
-        });
-        await this.logEvent(trade.id, 'BACK_REPLACE_FAILED', {
-          reason: 'No back price available',
-          timestamp: new Date().toISOString(),
-        });
-        return;
-      }
-      
-      this.logger.log(`[strategy:${STRATEGY_KEY}] Placing NEW back order @ current price ${currentBackPrice}`);
-      
-      // Place new back at current price
-      const newBackRes = await this.placeLimitOrderSafe(
-        market.marketId,
-        market.selectionId,
-        'BACK',
-        stake,
-        currentBackPrice,
-        sessionToken,
-        'goalreact-entry-retry'
-      );
-      
-      if (newBackRes.status === 'SUCCESS') {
-        this.logger.log(`[strategy:${STRATEGY_KEY}] ✓ NEW BACK PLACED @ ${currentBackPrice} - betId: ${newBackRes.betId}`);
-        
-        state.entry_price = currentBackPrice;
-        state.entry_time = Date.now();
-        state.back_bet_id = newBackRes.betId;
-        state.back_retry_count = (state.back_retry_count || 0) + 1;
-        
-        await this.logEvent(trade.id, 'BACK_REPLACED', {
-          old_bet_id: backBetId,
-          new_bet_id: newBackRes.betId,
-          new_price: currentBackPrice,
-          old_price: entryPrice,
-          retry_count: state.back_retry_count,
-          timestamp: new Date().toISOString(),
-        });
-        
-        // Recursively verify this new order (with retry limit)
-        if (state.back_retry_count <= 3) {
-          await this.waitAndVerifyBackThenPlaceLay(trade, state, newBackRes.betId, stake, currentBackPrice, sessionToken, market);
-        } else {
-          this.logger.error(`[strategy:${STRATEGY_KEY}] Max back retries (3) reached - giving up`);
-          state.phase = PHASE.SKIPPED;
-          await this.updateTrade(trade.id, {
-            status: 'skipped',
-            state_data: state,
-            last_error: 'MAX_BACK_RETRIES_REACHED',
-          });
-        }
-        return;
+        this.logger.warn(`[strategy:${STRATEGY_KEY}] No back price for retry - proceeding with matched portion only (£${backMatchedSize})`);
       } else {
-        this.logger.error(`[strategy:${STRATEGY_KEY}] New back order failed: ${newBackRes.errorCode}`);
-        state.phase = PHASE.SKIPPED;
-        await this.updateTrade(trade.id, {
-          status: 'skipped',
-          state_data: state,
-          last_error: `BACK_REPLACE_FAILED: ${newBackRes.errorCode}`,
-        });
-        await this.logEvent(trade.id, 'BACK_REPLACE_FAILED', {
-          errorCode: newBackRes.errorCode,
-          attempted_price: currentBackPrice,
-          timestamp: new Date().toISOString(),
-        });
-        return;
+        // STEP 3: Apply spread guardrail - only use back price if lay is within 1 tick
+        const useTightSpread = isWithinTicks(currentBackPrice, currentLayPrice, 1);
+        const retryPrice = useTightSpread ? currentBackPrice : currentLayPrice;
+        
+        this.logger.log(`[strategy:${STRATEGY_KEY}] Placing RETRY back @ ${retryPrice} for £${backRemainingSize} (back=${currentBackPrice}, lay=${currentLayPrice}, tight=${useTightSpread})`);
+        
+        const retryRes = await this.placeLimitOrderSafe(
+          market.marketId,
+          market.selectionId,
+          'BACK',
+          backRemainingSize,
+          retryPrice,
+          sessionToken,
+          'goalreact-entry-retry'
+        );
+        
+        if (retryRes.status === 'SUCCESS') {
+          this.logger.log(`[strategy:${STRATEGY_KEY}] ✓ RETRY BACK PLACED @ ${retryPrice} - betId: ${retryRes.betId}`);
+          
+          // Wait briefly for retry to match (5s, already at aggressive price)
+          const retryWaitMs = 5000;
+          let retryElapsed = 0;
+          let retryMatchedSize = 0;
+          let retryMatchedPrice = retryPrice;
+          
+          while (retryElapsed < retryWaitMs) {
+            const retryDetails = await this.getOrderDetailsSafe(retryRes.betId, sessionToken, 'verify-retry-back');
+            
+            if (!retryDetails) break; // Order disappeared
+            
+            retryMatchedSize = retryDetails.sizeMatched || 0;
+            retryMatchedPrice = retryDetails.averagePriceMatched || retryPrice;
+            
+            if (retryDetails.status === 'EXECUTION_COMPLETE' || (retryMatchedSize > 0 && retryDetails.sizeRemaining === 0)) {
+              this.logger.log(`[strategy:${STRATEGY_KEY}] ✓ RETRY MATCHED: £${retryMatchedSize} @ ${retryMatchedPrice}`);
+              break;
+            }
+            
+            await new Promise(resolve => setTimeout(resolve, 500));
+            retryElapsed += 500;
+          }
+          
+          // Cancel any remaining retry amount
+          if (retryElapsed >= retryWaitMs) {
+            const finalRetryCheck = await this.getOrderDetailsSafe(retryRes.betId, sessionToken, 'final-retry-check');
+            if (finalRetryCheck && finalRetryCheck.sizeRemaining > 0) {
+              await this.cancelOrderSafe(retryRes.betId, sessionToken, 'cancel-unmatched-retry');
+              retryMatchedSize = finalRetryCheck.sizeMatched || 0;
+              retryMatchedPrice = finalRetryCheck.averagePriceMatched || retryPrice;
+            }
+          }
+          
+          // Aggregate matched amounts
+          if (retryMatchedSize > 0) {
+            const totalMatched = backMatchedSize + retryMatchedSize;
+            const avgPrice = totalMatched > 0 
+              ? (backMatchedSize * backMatchedPrice + retryMatchedSize * retryMatchedPrice) / totalMatched
+              : entryPrice;
+            
+            this.logger.log(`[strategy:${STRATEGY_KEY}] Total matched: £${totalMatched} @ avg ${avgPrice.toFixed(2)} (original: £${backMatchedSize}, retry: £${retryMatchedSize})`);
+            
+            backMatchedSize = totalMatched;
+            backMatchedPrice = avgPrice;
+          }
+          
+          await this.logEvent(trade.id, 'BACK_RETRY', {
+            original_bet_id: backBetId,
+            original_matched: backMatchedSize - retryMatchedSize,
+            retry_bet_id: retryRes.betId,
+            retry_price: retryPrice,
+            retry_amount: backRemainingSize,
+            retry_matched: retryMatchedSize,
+            total_matched: backMatchedSize,
+            spread_guardrail: useTightSpread,
+            timestamp: new Date().toISOString(),
+          });
+        } else {
+          this.logger.warn(`[strategy:${STRATEGY_KEY}] Retry back failed: ${retryRes.errorCode} - proceeding with original matched portion (£${backMatchedSize})`);
+        }
       }
     }
     
-    // Back matched (fully or partially) - NOW place lay
+    // If nothing matched at all, skip trade - no exposure
+    if (backMatchedSize === 0) {
+      this.logger.warn(`[strategy:${STRATEGY_KEY}] ⚠️ Back did NOT match at all after ${maxWaitMs/1000}s - SKIPPING trade (no exposure)`);
+      
+      state.phase = PHASE.SKIPPED;
+      await this.updateTrade(trade.id, {
+        status: 'skipped',
+        state_data: state,
+        back_order_ref: backBetId,
+        back_matched_size: 0,
+        last_error: 'BACK_NOT_MATCHED_TIMEOUT',
+      });
+      
+      await this.logEvent(trade.id, 'BACK_NOT_MATCHED', {
+        betId: backBetId,
+        reason: `No match after ${maxWaitMs/1000}s timeout`,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+    
+    // We have matched back - now place lay for green-up
     this.logger.log(`[strategy:${STRATEGY_KEY}] Back verified matched: £${backMatchedSize} @ ${backMatchedPrice} - placing lay hedge`);
     
     const profitTargetPct = this.settings?.profit_target_pct || this.defaults.profit_target_pct;

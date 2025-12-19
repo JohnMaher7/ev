@@ -42,7 +42,7 @@ async function discoverCompetitions() {
     console.log(`Found ${result.length} total soccer competitions\n`);
     
     // Filter for major European leagues
-    const searchTerms = ['premier', 'liga', 'serie', 'bundesliga', 'ligue', 'europa'];
+    const searchTerms = ['premier', 'liga', 'serie', 'bundesliga', 'ligue', 'english'];
     const filtered = result.filter(c => {
       const name = c.competition?.name?.toLowerCase() || '';
       return searchTerms.some(term => name.includes(term));
