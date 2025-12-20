@@ -168,5 +168,38 @@ CREATE TRIGGER update_strategy_settings_updated_at
 CREATE TRIGGER update_strategy_fixtures_updated_at
     BEFORE UPDATE ON strategy_fixtures
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- GOAL PRICE SNAPSHOT ANALYTICS VIEW (GoalReactive)
+-- Extracts typed columns from GOAL_PRICE_SNAPSHOT events for easy analysis
+CREATE OR REPLACE VIEW goalreact_goal_price_snapshots AS
+SELECT
+    e.id,
+    e.trade_id,
+    e.occurred_at,
+    t.event_name,
+    t.competition_name,
+    t.kickoff_at,
+    (e.payload->>'goal_number')::int AS goal_number,
+    (e.payload->>'seconds_after_goal_target')::int AS seconds_after_goal_target,
+    (e.payload->>'seconds_after_goal_actual')::int AS seconds_after_goal_actual,
+    (e.payload->>'back_price')::numeric AS back_price,
+    (e.payload->>'lay_price')::numeric AS lay_price,
+    (e.payload->>'spread')::numeric AS spread,
+    (e.payload->>'baseline_price')::numeric AS baseline_price,
+    (e.payload->>'spike_price')::numeric AS spike_price,
+    (e.payload->>'mins_from_kickoff')::numeric AS mins_from_kickoff,
+    e.payload->>'timestamp' AS snapshot_timestamp
+FROM strategy_trade_events e
+JOIN strategy_trades t ON t.id = e.trade_id
+WHERE e.event_type = 'GOAL_PRICE_SNAPSHOT';
+
+-- Partial indexes for efficient GOAL_PRICE_SNAPSHOT queries
+CREATE INDEX IF NOT EXISTS idx_trade_events_goal_price_snapshot
+    ON strategy_trade_events(trade_id, occurred_at)
+    WHERE event_type = 'GOAL_PRICE_SNAPSHOT';
+
+CREATE INDEX IF NOT EXISTS idx_trade_events_snapshot_timing
+    ON strategy_trade_events(((payload->>'seconds_after_goal_target')::int))
+    WHERE event_type = 'GOAL_PRICE_SNAPSHOT';
 ```
 

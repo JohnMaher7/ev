@@ -172,26 +172,32 @@ export default function EplUnder25View() {
   const summary = useMemo(() => {
     return trades.reduce(
       (acc, trade) => {
-        acc.totalTrades += 1;
-        acc.totalStaked += getTotalStake(trade);
-        acc.pnl += getRealisedPnl(trade);
+        // Only count trades that were actually taken (back bet placed/matched)
+        if (isTakenTrade(trade)) {
+          acc.totalTrades += 1;
+          acc.totalStaked += getBackStake(trade);
+          acc.pnl += getRealisedPnl(trade);
+        }
         return acc;
       },
       { totalStaked: 0, totalTrades: 0, pnl: 0 },
     );
   }, [trades]);
 
-  // Calculate profit by competition
+  // Calculate profit by competition (only for taken trades)
   const competitionProfits = useMemo(() => {
     const profitMap = new Map<string, { pnl: number; trades: number; staked: number }>();
     
     trades.forEach(trade => {
+      // Only count trades that were actually taken (back bet placed/matched)
+      if (!isTakenTrade(trade)) return;
+      
       const compName = trade.competition_name || trade.competition || 'Unknown';
       const existing = profitMap.get(compName) || { pnl: 0, trades: 0, staked: 0 };
       profitMap.set(compName, {
         pnl: existing.pnl + getRealisedPnl(trade),
         trades: existing.trades + 1,
-        staked: existing.staked + getTotalStake(trade),
+        staked: existing.staked + getBackStake(trade),
       });
     });
     
@@ -259,7 +265,7 @@ function SummaryBar({
   return (
     <div className="grid gap-3 sm:grid-cols-3">
       <SummaryCard label="Overall P&L" value={formatCurrency(summary.pnl)} intent={summary.pnl >= 0 ? "positive" : "negative"} />
-      <SummaryCard label="Total Staked" value={formatCurrency(summary.totalStaked)} />
+      <SummaryCard label="Total Back Staked" value={formatCurrency(summary.totalStaked)} />
       <SummaryCard label="Number of Trades" value={summary.totalTrades} />
     </div>
   );
@@ -466,7 +472,7 @@ function TradesTable({
             <th className="w-8 px-2 py-3"></th>
             <th className="px-4 py-3 text-left font-medium">Strategy</th>
             <th className="px-4 py-3 text-left font-medium">Event</th>
-            <th className="px-4 py-3 text-right font-medium">Total Stake</th>
+            <th className="px-4 py-3 text-right font-medium">Back Stake</th>
             <th className="px-4 py-3 text-right font-medium">Back Price</th>
             <th className="px-4 py-3 text-right font-medium">P&L</th>
             <th className="px-4 py-3 text-right font-medium">Date</th>
@@ -480,7 +486,7 @@ function TradesTable({
             const eventLabel =
               trade.event_name ||
               (trade.home && trade.away ? `${trade.home} v ${trade.away}` : trade.runner_name || 'Under 2.5 Goals');
-            const totalStakeValue = getTotalStake(trade);
+            const backStakeValue = getBackStake(trade);
             const backPriceValue = trade.back_price_snapshot ?? trade.back_price;
             const pnlValue = getRealisedPnl(trade);
             const hasPnl = trade.realised_pnl !== null && trade.realised_pnl !== undefined
@@ -508,7 +514,7 @@ function TradesTable({
                     <StatusBadge status={trade.status} />
                   </td>
                   <td className="px-4 py-3 text-right font-mono">
-                    {formatCurrency(totalStakeValue)}
+                    {formatCurrency(backStakeValue)}
                   </td>
                   <td className="px-4 py-3 text-right font-mono">
                     {backPriceValue ? backPriceValue.toFixed(2) : '—'}
@@ -643,6 +649,20 @@ function formatEventPayload(payload: Record<string, unknown>): string {
   // Extract key fields for display
   const parts: string[] = [];
   
+  // --- Goal price snapshot (special formatting for t+30/60/90/120 snapshots) ---
+  if (payload.seconds_after_goal_target !== undefined) {
+    const target = payload.seconds_after_goal_target;
+    const backPrice = payload.back_price;
+    const layPrice = payload.lay_price;
+    const spread = payload.spread;
+    parts.push(`t+${target}s`);
+    if (backPrice !== undefined) parts.push(`back: ${backPrice}`);
+    if (layPrice !== undefined) parts.push(`lay: ${layPrice}`);
+    if (spread !== undefined) parts.push(`spread: ${spread}`);
+    if (payload.goal_number) parts.push(`goal: #${payload.goal_number}`);
+    return parts.join(' | ');
+  }
+  
   // --- Pre-match hedge fields ---
   if (payload.price) parts.push(`price: ${payload.price}`);
   if (payload.stake) parts.push(`stake: ${payload.stake}`);
@@ -720,6 +740,14 @@ function StatusBadge({ status }: { status: string }) {
 
 function getBackStake(trade: StrategyTrade) {
   return trade.back_stake ?? trade.back_matched_size ?? trade.back_size ?? trade.target_stake ?? 0;
+}
+
+/**
+ * A trade is "taken" if we have evidence of a placed/matched back bet.
+ * This excludes scheduled placeholders and GoalReactive watching/goal_wait pre-entry rows.
+ */
+function isTakenTrade(trade: StrategyTrade) {
+  return getBackStake(trade) > 0 || trade.back_order_ref != null;
 }
 
 function getTotalStake(trade: StrategyTrade) {

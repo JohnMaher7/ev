@@ -282,3 +282,82 @@ COMMENT ON COLUMN strategy_trades.total_stake IS 'Aggregate stake/exposure acros
 COMMENT ON COLUMN strategy_trades.realised_pnl IS 'Final realised profit/loss after hedging and commission';
 COMMENT ON COLUMN strategy_trades.settled_at IS 'Timestamp when the trade outcome was finalised (hedged/settled)';
 
+-- =============================================================================
+-- GOAL PRICE SNAPSHOT ANALYTICS (GoalReactive Strategy)
+-- =============================================================================
+-- View and indexes for analyzing price drift after goal detection.
+-- Data is stored in strategy_trade_events with event_type='GOAL_PRICE_SNAPSHOT'.
+-- This view extracts typed columns from the JSON payload for easy SQL queries.
+
+-- View: Extracts goal price snapshots as typed columns for analytics
+CREATE OR REPLACE VIEW goalreact_goal_price_snapshots AS
+SELECT
+    e.id,
+    e.trade_id,
+    e.occurred_at,
+    t.event_name,
+    t.competition_name,
+    t.kickoff_at,
+    (e.payload->>'goal_number')::int AS goal_number,
+    (e.payload->>'seconds_after_goal_target')::int AS seconds_after_goal_target,
+    (e.payload->>'seconds_after_goal_actual')::int AS seconds_after_goal_actual,
+    (e.payload->>'back_price')::numeric AS back_price,
+    (e.payload->>'lay_price')::numeric AS lay_price,
+    (e.payload->>'spread')::numeric AS spread,
+    (e.payload->>'baseline_price')::numeric AS baseline_price,
+    (e.payload->>'spike_price')::numeric AS spike_price,
+    (e.payload->>'mins_from_kickoff')::numeric AS mins_from_kickoff,
+    e.payload->>'timestamp' AS snapshot_timestamp
+FROM strategy_trade_events e
+JOIN strategy_trades t ON t.id = e.trade_id
+WHERE e.event_type = 'GOAL_PRICE_SNAPSHOT';
+
+COMMENT ON VIEW goalreact_goal_price_snapshots IS 'Typed view for goal price snapshots (t+30/60/90/120s) for entry timing analysis';
+
+-- Partial index: Speed up queries on GOAL_PRICE_SNAPSHOT events
+CREATE INDEX IF NOT EXISTS idx_trade_events_goal_price_snapshot
+    ON strategy_trade_events(trade_id, occurred_at)
+    WHERE event_type = 'GOAL_PRICE_SNAPSHOT';
+
+-- Expression index: Speed up grouping/filtering by snapshot timing (30/60/90/120)
+CREATE INDEX IF NOT EXISTS idx_trade_events_snapshot_timing
+    ON strategy_trade_events(((payload->>'seconds_after_goal_target')::int))
+    WHERE event_type = 'GOAL_PRICE_SNAPSHOT';
+
+-- =============================================================================
+-- EXAMPLE QUERIES FOR GOAL PRICE SNAPSHOT ANALYSIS
+-- =============================================================================
+-- 
+-- 1. Find which snapshot timing tends to have the highest price:
+--
+-- SELECT 
+--     seconds_after_goal_target,
+--     AVG(back_price) as avg_back_price,
+--     MAX(back_price) as max_back_price,
+--     COUNT(*) as snapshot_count
+-- FROM goalreact_goal_price_snapshots
+-- GROUP BY seconds_after_goal_target
+-- ORDER BY seconds_after_goal_target;
+--
+-- 2. Per-trade analysis: which snapshot had the highest price for each goal?
+--
+-- SELECT DISTINCT ON (trade_id) 
+--     trade_id, 
+--     event_name,
+--     seconds_after_goal_target as best_timing,
+--     back_price as peak_back_price
+-- FROM goalreact_goal_price_snapshots
+-- ORDER BY trade_id, back_price DESC;
+--
+-- 3. Compare price at goal detection vs each snapshot:
+--
+-- SELECT
+--     s.trade_id,
+--     s.event_name,
+--     s.spike_price as price_at_goal,
+--     s.seconds_after_goal_target,
+--     s.back_price,
+--     ROUND(((s.back_price - s.spike_price) / s.spike_price * 100)::numeric, 1) as pct_change_from_spike
+-- FROM goalreact_goal_price_snapshots s
+-- ORDER BY s.trade_id, s.seconds_after_goal_target;
+

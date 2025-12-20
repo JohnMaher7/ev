@@ -47,7 +47,7 @@ function getDefaultSettings() {
     // Code is the source of truth for this strategy's settings.
     // (Avoid env overrides here to prevent accidental config drift / Supabase "reverts".)
     default_stake: 200,
-    wait_after_goal_seconds: 90,
+    wait_after_goal_seconds: 80,
     goal_cutoff_minutes: 45,
     min_entry_price: 2.0,
     max_entry_price: 5.5,
@@ -58,7 +58,7 @@ function getDefaultSettings() {
     stop_loss_pct: 15,
     
     // Polling
-    in_play_poll_interval_seconds: 30,
+    in_play_poll_interval_seconds: 15,
     
     // General
     fixture_lookahead_days: 7,
@@ -736,6 +736,64 @@ class EplUnder25GoalReactStrategy {
 
   // --- Phase Handlers ---
 
+  /**
+   * Log goal price snapshots at t+30/60/90/120 seconds after goal detection.
+   * Called from handleGoalWait and handleLive to capture price drift over time.
+   * Each snapshot logs once per threshold (uses flags in state.goal_snapshot_flags).
+   * 
+   * @param {Object} trade - The trade record
+   * @param {Object} state - The state_data object (will be mutated with flags)
+   * @param {number} backPrice - Current back price
+   * @param {number} layPrice - Current lay price
+   * @param {number|null} minsFromKickoff - Minutes from kickoff (optional context)
+   * @returns {boolean} - True if any snapshot was logged (caller should persist state)
+   */
+  async logGoalPriceSnapshots(trade, state, backPrice, layPrice, minsFromKickoff = null) {
+    // Only run if we have a spike_detected_at timestamp
+    if (!state.spike_detected_at) return false;
+    
+    // Initialize flags if missing (safety for existing trades)
+    if (!state.goal_snapshot_flags) {
+      state.goal_snapshot_flags = { s30: false, s60: false, s90: false, s120: false };
+    }
+    
+    const elapsed = (Date.now() - state.spike_detected_at) / 1000;
+    const thresholds = [
+      { key: 's30', target: 30 },
+      { key: 's60', target: 60 },
+      { key: 's90', target: 90 },
+      { key: 's120', target: 120 },
+    ];
+    
+    let logged = false;
+    
+    for (const { key, target } of thresholds) {
+      if (elapsed >= target && !state.goal_snapshot_flags[key]) {
+        // Log snapshot
+        const spread = layPrice && backPrice ? (layPrice - backPrice) : null;
+        await this.logEvent(trade.id, 'GOAL_PRICE_SNAPSHOT', {
+          goal_number: state.goal_number || 1,
+          seconds_after_goal_target: target,
+          seconds_after_goal_actual: Math.round(elapsed),
+          back_price: backPrice,
+          lay_price: layPrice,
+          spread: spread ? Number(spread.toFixed(2)) : null,
+          baseline_price: state.baseline_price,
+          spike_price: state.spike_price,
+          mins_from_kickoff: minsFromKickoff != null ? Number(minsFromKickoff.toFixed(1)) : null,
+          timestamp: new Date().toISOString(),
+        });
+        
+        this.logger.log(`[strategy:${STRATEGY_KEY}] 📸 SNAPSHOT t+${target}s: back=${backPrice} | lay=${layPrice} | spread=${spread?.toFixed(2) || 'N/A'}`);
+        
+        state.goal_snapshot_flags[key] = true;
+        logged = true;
+      }
+    }
+    
+    return logged;
+  }
+
   async handleWatching(trade, state, backPrice, layPrice, minsFromKickoff, sessionToken, market) {
     const goalCutoff = this.settings?.goal_cutoff_minutes || this.defaults.goal_cutoff_minutes;
     const goalDetectionPct = this.settings?.goal_detection_pct || this.defaults.goal_detection_pct;
@@ -798,6 +856,8 @@ class EplUnder25GoalReactStrategy {
       state.spike_detected_at = Date.now();
       state.spike_price = backPrice;
       state.goal_number = 1;
+      // Initialize snapshot flags for price logging at t+30/60/90/120 seconds
+      state.goal_snapshot_flags = { s30: false, s60: false, s90: false, s120: false };
       
       await this.updateTrade(trade.id, { 
         status: 'goal_wait',
@@ -828,6 +888,12 @@ class EplUnder25GoalReactStrategy {
     const maxEntryPrice = this.settings?.max_entry_price || this.defaults.max_entry_price;
     
     const elapsed = (Date.now() - state.spike_detected_at) / 1000;
+    
+    // Log price snapshots at t+30/60/90/120 (for entry timing analysis)
+    const snapshotLogged = await this.logGoalPriceSnapshots(trade, state, backPrice, layPrice);
+    if (snapshotLogged) {
+      await this.updateTrade(trade.id, { state_data: state });
+    }
     
     // Check if price has fallen back (false alarm - VAR?)
     const priceChange = ((backPrice - state.baseline_price) / state.baseline_price) * 100;
@@ -1223,6 +1289,12 @@ class EplUnder25GoalReactStrategy {
 
   async handleLive(trade, state, backPrice, layPrice, sessionToken, market) {
     const goalDetectionPct = this.settings?.goal_detection_pct || this.defaults.goal_detection_pct;
+    
+    // Continue logging price snapshots at t+90/120 (may have started in GOAL_WAIT)
+    const snapshotLogged = await this.logGoalPriceSnapshots(trade, state, backPrice, layPrice);
+    if (snapshotLogged) {
+      await this.updateTrade(trade.id, { state_data: state });
+    }
     
     const entryPrice = state.entry_price;
     const layBetId = state.lay_bet_id || trade.lay_order_ref;
