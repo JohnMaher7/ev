@@ -137,6 +137,10 @@ EPL_UNDER25_MIN_BACK_PRICE=1.8
 EPL_UNDER25_BACK_LEAD_MINUTES=30
 EPL_UNDER25_LAY_TICKS_BELOW=2
 EPL_UNDER25_LAY_PERSISTENCE=PERSIST  # Keep lay order in-play
+
+# Goal spike recovery (stop-loss style drift exit after confirmed goal)
+EPL_UNDER25_STOP_LOSS_WAIT_SECONDS=180
+EPL_UNDER25_STOP_LOSS_PCT=15
 ```
 
 ### Strategy 2: Goal Reactive (`epl_under25_goalreact`)

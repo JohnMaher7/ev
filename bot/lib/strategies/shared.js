@@ -95,7 +95,12 @@ function computeTargetLayPrice(backPrice, settings) {
  * Green-up formula:
  * - Profit if selection wins:  backStake × (backPrice - 1) - layStake × (layPrice - 1)
  * - Profit if selection loses: layStake - backStake
- * - Realised P&L = min(profitIfWins, profitIfLoses) × (1 - commission)
+ * - Realised P&L = min(profitIfWins, profitIfLoses)
+ * 
+ * Commission handling:
+ * - Betfair charges commission only on net winnings (profitable markets)
+ * - If the net result is negative (loss), no commission is charged
+ * - If the net result is positive (profit), commission is deducted from winnings
  */
 function computeRealisedPnlSnapshot({ backStake, backPrice, layStake, layPrice, commission = 0.02 }) {
   // Return null if back data is missing
@@ -116,12 +121,15 @@ function computeRealisedPnlSnapshot({ backStake, backPrice, layStake, layPrice, 
   // Profit if selection LOSES (back bet loses, lay bet wins)
   const profitIfLoses = layStake - backStake;
   
-  // Apply commission to both scenarios
-  const profitWinsAfterComm = profitIfWins * (1 - commission);
-  const profitLosesAfterComm = profitIfLoses * (1 - commission);
-  
   // Realised P&L is the guaranteed minimum profit (or maximum loss)
-  const realised = Math.min(profitWinsAfterComm, profitLosesAfterComm);
+  const grossRealised = Math.min(profitIfWins, profitIfLoses);
+  
+  // Apply commission only to profits (net winnings), not losses
+  // Betfair charges commission at the overall market level only on profitable markets
+  const realised = grossRealised >= 0 
+    ? grossRealised * (1 - commission)  // Commission deducted from profits
+    : grossRealised;  // No commission on losses
+  
   return Number(realised.toFixed(2));
 }
 

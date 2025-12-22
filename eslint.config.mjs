@@ -36,6 +36,15 @@ const eslintConfig = [
     },
   },
   {
+    files: ["scripts/**/*.js", "discover_competitions.js"],
+    languageOptions: {
+      sourceType: "commonjs",
+    },
+    rules: {
+      "@typescript-eslint/no-require-imports": "off",
+    },
+  },
+  {
     files: ["jest.config.js"],
     languageOptions: {
       sourceType: "commonjs",

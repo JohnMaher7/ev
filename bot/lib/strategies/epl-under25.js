@@ -19,15 +19,23 @@ const STRATEGY_KEY = 'epl_under25';
 
 function getDefaultSettings() {
   return {
-    default_stake: parseFloat(process.env.EPL_UNDER25_DEFAULT_STAKE || '150'),
-    fixture_lookahead_days: parseInt(process.env.EPL_UNDER25_FIXTURE_LOOKAHEAD_DAYS || '7', 10),
-    commission_rate: parseFloat(process.env.EPL_UNDER25_COMMISSION_RATE || '0.0175'),
+    // Code is the source of truth for this strategy's settings.
+    // (Avoid env overrides here to prevent accidental config drift / Supabase "reverts".)
+    default_stake: 200,
+    fixture_lookahead_days: 2,
+    commission_rate: 0.0175,
     // Strategy-specific settings (stored in extra JSONB)
-    min_back_price: parseFloat(process.env.EPL_UNDER25_MIN_BACK_PRICE || '1.8'),
-    min_profit_pct: parseFloat(process.env.EPL_UNDER25_MIN_PROFIT_PCT || '10'),
-    back_lead_minutes: parseInt(process.env.EPL_UNDER25_BACK_LEAD_MINUTES || '30', 10),
-    lay_ticks_below_back: parseInt(process.env.EPL_UNDER25_LAY_TICKS_BELOW || '2', 10),
-    lay_persistence: process.env.EPL_UNDER25_LAY_PERSISTENCE || 'PERSIST', // PERSIST = keep in-play
+    min_back_price: 1.7,
+    min_profit_pct: 10,
+    back_lead_minutes: 45,
+    lay_ticks_below_back: 3,
+    lay_persistence: 'PERSIST', // PERSIST = keep in-play
+
+    // Stop-loss / recovery (goal-react style: wait, then exit on drift)
+    // NOTE: This strategy already detects goal spikes and enters recovery mode.
+    // These settings make the wait + drift percentage configurable.
+    stop_loss_wait_seconds: 180,
+    stop_loss_pct: 20,
   };
 }
 
@@ -529,7 +537,7 @@ class EplUnder25Strategy {
     }
   }
 
-  async placeLimitLaySafe(marketId, selectionId, size, price, sessionToken, label) {
+  async placeLimitLaySafe(marketId, selectionId, size, price, sessionToken, label, persistenceType = 'LAPSE') {
     const customerRef = `LAY-${Date.now()}`;
     try {
       const placeRes = await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/placeOrders', {
@@ -543,7 +551,7 @@ class EplUnder25Strategy {
             limitOrder: {
               size,
               price,
-              persistenceType: 'LAPSE',
+              persistenceType,
             },
           },
         ],
@@ -556,6 +564,52 @@ class EplUnder25Strategy {
     } catch (err) {
       return { status: 'FAILED', errorCode: 'EXCEPTION' };
     }
+  }
+
+  /**
+   * Place order with verification and retry logic
+   * GUARDRAIL: Verifies order placement succeeded, retries if cancelled due to suspension
+   * 
+   * @param {Object} params - Order parameters
+   * @param {string} params.marketId - Market ID
+   * @param {number} params.selectionId - Selection ID
+   * @param {number} params.stake - Order stake
+   * @param {number} params.price - Order price
+   * @param {string} params.sessionToken - Betfair session token
+   * @param {string} params.label - Log label
+   * @param {string} params.persistenceType - Persistence type (LAPSE or PERSIST)
+   * @param {number} params.maxRetries - Max retry attempts (default 3)
+   * @param {number} params.verifyDelayMs - Delay before verification (default 1000ms)
+   * @returns {Object} { status: 'SUCCESS'|'FAILED', betId, matchedSize, error }
+   */
+  /**
+   * Place order with lightweight verification (no blocking delay)
+   * GUARDRAIL: Returns immediately, continuous monitoring handles retries
+   * 
+   * NOTE: We skip the verification delay to avoid slowing down the bot.
+   * The RECOVERY_PENDING and MONITORING phases already check order status
+   * on every poll cycle and will retry if cancelled.
+   */
+  async placeLayOrderWithVerification({ marketId, selectionId, stake, price, sessionToken, label, persistenceType = 'LAPSE', maxRetries = 1, verifyDelayMs = 0 }) {
+    // Place the order (single attempt - retries handled by state machine)
+    const placeRes = await this.placeLimitLaySafe(marketId, selectionId, stake, price, sessionToken, label, persistenceType);
+    
+    if (placeRes.status !== 'SUCCESS') {
+      this.logger.warn(`[strategy:epl_under25] Order placement failed: ${placeRes.errorCode}`);
+      return { status: 'FAILED', error: placeRes.errorCode, attempts: 1 };
+    }
+    
+    this.logger.log(`[strategy:epl_under25] Order placed: ${placeRes.betId} @ ${price}`);
+    
+    // Return immediately - state machine polling will verify and retry if needed
+    return {
+      status: 'SUCCESS',
+      betId: placeRes.betId,
+      matchedSize: 0,
+      remainingSize: stake,
+      orderStatus: 'EXECUTABLE',
+      attempts: 1,
+    };
   }
 
   calculateHedgeStakeFromBook(book, selectionId, trade, overrideLayPrice = null) {
@@ -593,6 +647,8 @@ class EplUnder25Strategy {
           back_lead_minutes: this.defaults.back_lead_minutes,
           lay_ticks_below_back: this.defaults.lay_ticks_below_back,
           lay_persistence: this.defaults.lay_persistence,
+          stop_loss_wait_seconds: this.defaults.stop_loss_wait_seconds,
+          stop_loss_pct: this.defaults.stop_loss_pct,
         },
       };
       const { data: created, error: insertErr } = await this.supabase
@@ -601,38 +657,69 @@ class EplUnder25Strategy {
         .select()
         .single();
       if (insertErr) throw insertErr;
-      this.settings = { ...created, ...created.extra };
+      // Flatten `extra` but prevent it from shadowing top-level columns.
+      const createdExtra = created.extra || {};
+      const {
+        enabled: _enabled,
+        default_stake: _defaultStake,
+        fixture_lookahead_days: _fixtureLookaheadDays,
+        commission_rate: _commissionRate,
+        ...createdExtraFlat
+      } = createdExtra;
+      this.settings = { ...created, ...createdExtraFlat };
     } else {
       // Merge top-level and extra fields (extra takes precedence)
-      this.settings = { ...data, ...(data.extra || {}) };
+      // Flatten `extra` but prevent it from shadowing top-level columns.
+      const existingExtra = data.extra || {};
+      const {
+        enabled: _enabled,
+        default_stake: _defaultStake,
+        fixture_lookahead_days: _fixtureLookaheadDays,
+        commission_rate: _commissionRate,
+        ...existingExtraFlat
+      } = existingExtra;
+      this.settings = { ...data, ...existingExtraFlat };
       
-      // Auto-sync env var changes to database (for operational flexibility)
+      // Code defaults are the source of truth: auto-sync to database (one-way).
       const updates = {};
       const extraUpdates = {};
       let needsUpdate = false;
       
-      // Check common settings
-      if (this.settings.default_stake !== this.defaults.default_stake) {
-        this.logger.log(`[strategy:epl_under25] Syncing default_stake: ${this.settings.default_stake} → ${this.defaults.default_stake} (from env var)`);
+      // Top-level columns
+      if (data.default_stake !== this.defaults.default_stake) {
+        this.logger.log(`[strategy:epl_under25] Syncing default_stake: ${data.default_stake} → ${this.defaults.default_stake} (from code defaults)`);
         updates.default_stake = this.defaults.default_stake;
         needsUpdate = true;
       }
+      if (data.fixture_lookahead_days !== this.defaults.fixture_lookahead_days) {
+        this.logger.log(`[strategy:epl_under25] Syncing fixture_lookahead_days: ${data.fixture_lookahead_days} → ${this.defaults.fixture_lookahead_days} (from code defaults)`);
+        updates.fixture_lookahead_days = this.defaults.fixture_lookahead_days;
+        needsUpdate = true;
+      }
+      if (data.commission_rate !== this.defaults.commission_rate) {
+        this.logger.log(`[strategy:epl_under25] Syncing commission_rate: ${data.commission_rate} → ${this.defaults.commission_rate} (from code defaults)`);
+        updates.commission_rate = this.defaults.commission_rate;
+        needsUpdate = true;
+      }
       
-      // Check strategy-specific settings in extra
-      if ((this.settings.min_back_price || this.defaults.min_back_price) !== this.defaults.min_back_price) {
-        this.logger.log(`[strategy:epl_under25] Syncing min_back_price: ${this.settings.min_back_price} → ${this.defaults.min_back_price} (from env var)`);
-        extraUpdates.min_back_price = this.defaults.min_back_price;
-        needsUpdate = true;
-      }
-      if ((this.settings.min_profit_pct || this.defaults.min_profit_pct) !== this.defaults.min_profit_pct) {
-        this.logger.log(`[strategy:epl_under25] Syncing min_profit_pct: ${this.settings.min_profit_pct} → ${this.defaults.min_profit_pct} (from env var)`);
-        extraUpdates.min_profit_pct = this.defaults.min_profit_pct;
-        needsUpdate = true;
-      }
-      if ((this.settings.back_lead_minutes || this.defaults.back_lead_minutes) !== this.defaults.back_lead_minutes) {
-        this.logger.log(`[strategy:epl_under25] Syncing back_lead_minutes: ${this.settings.back_lead_minutes} → ${this.defaults.back_lead_minutes} (from env var)`);
-        extraUpdates.back_lead_minutes = this.defaults.back_lead_minutes;
-        needsUpdate = true;
+      // Strategy-specific settings in `extra` JSON
+      const extraKeys = [
+        'min_back_price',
+        'min_profit_pct',
+        'back_lead_minutes',
+        'lay_ticks_below_back',
+        'lay_persistence',
+        'stop_loss_wait_seconds',
+        'stop_loss_pct',
+      ];
+      for (const k of extraKeys) {
+        // Match goal-react behavior: if missing or different, sync to defaults.
+        // (This also backfills new keys into `extra` on existing rows.)
+        if (this.settings[k] !== this.defaults[k]) {
+          this.logger.log(`[strategy:epl_under25] Syncing ${k}: ${this.settings[k]} → ${this.defaults[k]} (from code defaults)`);
+          extraUpdates[k] = this.defaults[k];
+          needsUpdate = true;
+        }
       }
       
       if (needsUpdate) {
@@ -642,10 +729,11 @@ class EplUnder25Strategy {
           updates.extra = { ...currentExtra, ...extraUpdates };
         }
         
-        await this.supabase
+        const { error: updateErr } = await this.supabase
           .from('strategy_settings')
           .update(updates)
           .eq('strategy_key', STRATEGY_KEY);
+        if (updateErr) throw updateErr;
         
         // Update local settings
         Object.assign(this.settings, updates);
@@ -664,7 +752,16 @@ class EplUnder25Strategy {
       .maybeSingle();
     if (error && error.code !== 'PGRST116') throw error;
     if (data) {
-      this.settings = data;
+      // Keep the same flattened shape as ensureSettings() for downstream logic.
+      const extra = data.extra || {};
+      const {
+        enabled: _enabled,
+        default_stake: _defaultStake,
+        fixture_lookahead_days: _fixtureLookaheadDays,
+        commission_rate: _commissionRate,
+        ...extraFlat
+      } = extra;
+      this.settings = { ...data, ...extraFlat };
     }
   }
 
@@ -1303,28 +1400,85 @@ class EplUnder25Strategy {
       if (currentBackPrice) {
         if (currentBackPrice > (state.last_stable_price * 1.30)) {
           // SPIKE DETECTED - 30% price movement indicates possible goal
-          this.logger.log(`[strategy:epl_under25] Goal Detected (Price: ${currentBackPrice.toFixed(2)} > ${(state.last_stable_price * 1.30).toFixed(2)}) - Cancelling profit order`);
+          this.logger.log(`[strategy:epl_under25] 🎯 Goal Detected (Price: ${currentBackPrice.toFixed(2)} > ${(state.last_stable_price * 1.30).toFixed(2)}) - Cancelling profit order`);
           
-          await this.cancelOrderSafe(state.profit_order_id, sessionToken, 'phase2-cancel');
-          // Verify cancellation (best effort)
-          const verifyStatus = await this.getOrderStatusSafe(state.profit_order_id, sessionToken, 'phase2-cancel-verify');
-          if (verifyStatus === 'EXECUTION_COMPLETE') {
-              // Order matched during cancel? Treat as success
-              this.logger.log('[strategy:epl_under25] Profit order matched during cancellation - Success!');
+          // Cancel the profit lay order
+          await this.cancelOrderSafe(state.profit_order_id, sessionToken, 'phase2-cancel-goal');
+          
+          // CRITICAL FIX: Verify cancellation and check if lay was matched before/during cancel
+          const orderDetails = await this.getOrderDetailsSafe(state.profit_order_id, sessionToken, 'phase2-verify-after-goal');
+          const expectedLaySize = state.lay_snapshot?.stake || trade.lay_size || 0;
+          
+          if (orderDetails) {
+            const matchedSize = orderDetails.sizeMatched || 0;
+            const matchedPrice = orderDetails.averagePriceMatched || state.lay_snapshot?.price || trade.lay_price;
+            
+            // Scenario 1: Fully matched - trade is complete with profit!
+            if (orderDetails.status === 'EXECUTION_COMPLETE' || (matchedSize > 0 && orderDetails.sizeRemaining === 0)) {
+              this.logger.log(`[strategy:epl_under25] 🏆 LAY WAS FULLY MATCHED during goal! £${matchedSize} @ ${matchedPrice} - settling as WIN`);
+              
               state.phase = 'COMPLETED';
-              await this.settleTradeWithPnl(trade, state);
+              await this.settleTradeWithPnl(trade, state, {
+                layStakeOverride: matchedSize,
+                layPriceOverride: matchedPrice,
+              });
+              
+              await this.logEvent(trade.id, 'LAY_MATCHED_DURING_GOAL', {
+                betId: state.profit_order_id,
+                matched_size: matchedSize,
+                matched_price: matchedPrice,
+                goal_detected: true,
+                timestamp: new Date().toISOString(),
+              });
               
               // Trigger smart scheduler to recalculate (trade completed)
               if (process.env.EPL_UNDER25_SCHEDULER_MODE === 'smart' || !process.env.EPL_UNDER25_SCHEDULER_MODE) {
                 setImmediate(() => this.smartSchedulerLoop());
               }
               return;
+            }
+            
+            // Scenario 2: Partially matched - record partial match, continue to stop-loss for remaining
+            if (matchedSize > 0 && matchedSize < expectedLaySize) {
+              this.logger.log(`[strategy:epl_under25] ⚠️ LAY PARTIALLY MATCHED before goal: £${matchedSize} of £${expectedLaySize} @ ${matchedPrice}`);
+              this.logger.log(`[strategy:epl_under25]   Remaining unhedged exposure: £${(expectedLaySize - matchedSize).toFixed(2)} - proceeding to EVENT_WAIT`);
+              
+              // Store partial match info for stop-loss calculation
+              state.partial_lay_matched = matchedSize;
+              state.partial_lay_price = matchedPrice;
+              
+              await this.logEvent(trade.id, 'LAY_PARTIAL_MATCH_ON_GOAL', {
+                betId: state.profit_order_id,
+                matched_size: matchedSize,
+                expected_size: expectedLaySize,
+                matched_price: matchedPrice,
+                remaining_exposure: expectedLaySize - matchedSize,
+                timestamp: new Date().toISOString(),
+              });
+              // Continue to EVENT_WAIT below
+            } else {
+              // Scenario 3: Not matched at all - full exposure remains
+              this.logger.log(`[strategy:epl_under25] Lay order cancelled successfully (no matches) - full exposure remains`);
+            }
+          } else {
+            // Order not found - likely cancelled successfully
+            this.logger.log(`[strategy:epl_under25] Lay order ${state.profit_order_id} not found after cancel - assuming cancelled`);
           }
 
           state.phase = 'EVENT_WAIT';
           state.spike_start_ts = Date.now();
           state.peak_price = currentBackPrice;
+          state.lay_cancelled_on_goal = true;
           updatedState = true;
+          
+          await this.logEvent(trade.id, 'GOAL_DETECTED_LAY_CANCELLED', {
+            current_price: currentBackPrice,
+            stable_price: state.last_stable_price,
+            spike_pct: ((currentBackPrice - state.last_stable_price) / state.last_stable_price * 100),
+            partial_lay_matched: state.partial_lay_matched || 0,
+            partial_lay_price: state.partial_lay_price || 0,
+            timestamp: new Date().toISOString(),
+          });
         } else {
           // Update stable price
           state.last_stable_price = currentBackPrice;
@@ -1336,6 +1490,7 @@ class EplUnder25Strategy {
     // --- PHASE 3: EVENT CONFIRMATION (180s) ---
     else if (phase === 'EVENT_WAIT') {
       const elapsed = (Date.now() - (state.spike_start_ts || 0)) / 1000;
+      const stopLossWaitSeconds = this.settings?.stop_loss_wait_seconds || this.defaults.stop_loss_wait_seconds || 180;
       const book = await this.getMarketBookSafe(market.marketId, sessionToken, 'phase3-book');
       const runner = book?.runners?.find(r => r.selectionId == market.selectionId);
       const currentBackPrice = runner?.ex?.availableToBack?.[0]?.price;
@@ -1345,8 +1500,8 @@ class EplUnder25Strategy {
         updatedState = true;
       }
 
-      if (elapsed >= 180) { // 3 minutes
-        this.logger.log(`[strategy:epl_under25] Phase 3 Decision Time (180s elapsed). Current: ${currentBackPrice?.toFixed(2)}, Stable: ${state.last_stable_price?.toFixed(2)}`);
+      if (elapsed >= stopLossWaitSeconds) {
+        this.logger.log(`[strategy:epl_under25] Phase 3 Decision Time (${stopLossWaitSeconds}s elapsed). Current: ${currentBackPrice?.toFixed(2)}, Stable: ${state.last_stable_price?.toFixed(2)}`);
 
         // Scenario A: False Alarm (VAR check / disallowed goal)
         if (currentBackPrice && currentBackPrice < (state.last_stable_price * 1.10)) {
@@ -1373,6 +1528,14 @@ class EplUnder25Strategy {
         else {
           this.logger.log('[strategy:epl_under25] Goal Confirmed - Entering Recovery Phase');
           
+          // Check for partial lay match from earlier goal cancellation
+          const partialLayMatched = state.partial_lay_matched || 0;
+          const partialLayPrice = state.partial_lay_price || 0;
+          
+          if (partialLayMatched > 0) {
+            this.logger.log(`[strategy:epl_under25] Partial lay already matched: £${partialLayMatched} @ ${partialLayPrice}`);
+          }
+          
           // Capture baseline price for drift calculation
           const baselineLayPrice = runner?.ex?.availableToLay?.[0]?.price;
           if (!baselineLayPrice) {
@@ -1380,25 +1543,78 @@ class EplUnder25Strategy {
             return;
           }
           
-          // Calculate target hedge price: 85% of current price (15% drift down)
-          const targetHedgePrice = roundToBetfairTick(baselineLayPrice * 0.85);
-          const { layStake } = this.calculateHedgeStakeFromBook(book, market.selectionId, trade, targetHedgePrice);
+          const stopLossPct = this.settings?.stop_loss_pct || this.defaults.stop_loss_pct || 15;
+          const driftFactor = 1 - (stopLossPct / 100);
+
+          // Calculate target hedge price: (1 - stopLossPct%) of baseline lay price
+          const targetHedgePrice = roundToBetfairTick(baselineLayPrice * driftFactor);
+          
+          // Calculate remaining exposure after partial match
+          const fullBackStake = trade.back_matched_size || trade.back_stake || trade.back_size || 0;
+          let remainingBackExposure = fullBackStake;
+          
+          if (partialLayMatched > 0 && partialLayPrice > 0) {
+            // Partial lay covers: partialLayMatched * partialLayPrice / backPrice worth of back stake
+            const backPrice = trade.back_price;
+            const hedgedBackAmount = (partialLayMatched * partialLayPrice) / backPrice;
+            remainingBackExposure = Math.max(0, fullBackStake - hedgedBackAmount);
+            this.logger.log(`[strategy:epl_under25] Partial lay hedged £${hedgedBackAmount.toFixed(2)} of back`);
+            this.logger.log(`[strategy:epl_under25] Remaining unhedged exposure: £${remainingBackExposure.toFixed(2)} (of £${fullBackStake})`);
+          }
+          
+          // Calculate lay stake for remaining exposure only
+          const { layStake } = calculateHedgeStake(book, market.selectionId, remainingBackExposure, trade.back_price, this.settings.commission_rate, targetHedgePrice);
           
           if (layStake > 0) {
-            // Place limit order at target immediately
-            const placeRes = await this.placeLimitLaySafe(market.marketId, market.selectionId, layStake, targetHedgePrice, sessionToken, 'phase4-place');
+            // GUARDRAIL: Place order with verification and retry
+            const placeResult = await this.placeLayOrderWithVerification({
+              marketId: market.marketId,
+              selectionId: market.selectionId,
+              stake: layStake,
+              price: targetHedgePrice,
+              sessionToken,
+              label: 'phase3-recovery',
+              persistenceType: 'PERSIST',  // Keep in-play for recovery
+              maxRetries: 3,
+              verifyDelayMs: 500,
+            });
             
-            if (placeRes.status === 'SUCCESS') {
-              this.logger.log(`[strategy:epl_under25] Recovery order placed: Lay @ ${targetHedgePrice} (15% below ${baselineLayPrice.toFixed(2)}) - bet ID: ${placeRes.betId}`);
+            if (placeResult.status === 'SUCCESS' || placeResult.status === 'PARTIAL') {
+              this.logger.log(`[strategy:epl_under25] ✓ Recovery order placed: Lay @ ${targetHedgePrice} (${stopLossPct}% below ${baselineLayPrice.toFixed(2)}) - bet ID: ${placeResult.betId}`);
               state.phase = 'RECOVERY_PENDING';
-              state.recovery_order_id = placeRes.betId;
+              state.recovery_order_id = placeResult.betId;
               state.recovery_target_price = targetHedgePrice;
+              state.recovery_retry_count = 0;
               state.lay_snapshot = { stake: layStake, price: targetHedgePrice };
-              await this.recordLaySnapshot(trade, { layStake, layPrice: targetHedgePrice, betId: placeRes.betId });
+              state.partial_lay_matched = partialLayMatched;
+              state.partial_lay_price = partialLayPrice;
+              await this.recordLaySnapshot(trade, { layStake, layPrice: targetHedgePrice, betId: placeResult.betId });
               updatedState = true;
+              
+              await this.logEvent(trade.id, 'RECOVERY_ORDER_PLACED', {
+                betId: placeResult.betId,
+                lay_price: targetHedgePrice,
+                lay_stake: layStake,
+                baseline_price: baselineLayPrice,
+                stop_loss_pct: stopLossPct,
+                partial_lay_matched: partialLayMatched,
+                partial_lay_price: partialLayPrice,
+                remaining_exposure: remainingBackExposure,
+                verification_attempts: placeResult.attempts,
+                timestamp: new Date().toISOString(),
+              });
             } else {
-              this.logger.error(`[strategy:epl_under25] Failed to place recovery order: ${placeRes.errorCode}`);
+              this.logger.error(`[strategy:epl_under25] ❌ Failed to place recovery order after ${placeResult.attempts} attempts: ${placeResult.error}`);
+              await this.logEvent(trade.id, 'RECOVERY_ORDER_FAILED', {
+                error: placeResult.error,
+                attempts: placeResult.attempts,
+                baseline_price: baselineLayPrice,
+                target_price: targetHedgePrice,
+                timestamp: new Date().toISOString(),
+              });
             }
+          } else {
+            this.logger.warn(`[strategy:epl_under25] No lay stake needed - exposure may be fully hedged by partial match`);
           }
         }
       }
@@ -1406,25 +1622,188 @@ class EplUnder25Strategy {
 
     // --- PHASE 4: RECOVERY PENDING (Wait for Drift Order to Match) ---
     else if (phase === 'RECOVERY_PENDING') {
-      // Check if recovery order has been matched
-      const orderStatus = await this.getOrderStatusSafe(state.recovery_order_id, sessionToken, 'phase4-status');
+      // CRITICAL FIX: Verify ACTUAL order details, not just status
+      // Orders can be cancelled/lapsed due to market suspension
+      const orderDetails = await this.getOrderDetailsSafe(state.recovery_order_id, sessionToken, 'phase4-verify');
       
-      if (orderStatus === 'EXECUTION_COMPLETE') {
+      if (!orderDetails) {
+        // Order not found - might be cancelled due to suspension
+        this.logger.warn(`[strategy:epl_under25] ⚠️ Recovery order ${state.recovery_order_id} NOT FOUND - likely cancelled`);
+        
+        // GUARDRAIL: Retry placing the stop-loss order
+        const retryCount = state.recovery_retry_count || 0;
+        const maxRetries = 3;
+        
+        if (retryCount < maxRetries) {
+          this.logger.log(`[strategy:epl_under25] Retrying recovery order (attempt ${retryCount + 1}/${maxRetries})`);
+          
+          const book = await this.getMarketBookSafe(market.marketId, sessionToken, 'phase4-retry-book');
+          const runner = book?.runners?.find(r => r.selectionId == market.selectionId);
+          const currentLayPrice = runner?.ex?.availableToLay?.[0]?.price;
+          
+          if (currentLayPrice) {
+            const { layStake } = this.calculateHedgeStakeFromBook(book, market.selectionId, trade, currentLayPrice);
+            
+            if (layStake > 0) {
+              const placeRes = await this.placeLimitLaySafe(market.marketId, market.selectionId, layStake, currentLayPrice, sessionToken, 'phase4-retry');
+              
+              if (placeRes.status === 'SUCCESS') {
+                this.logger.log(`[strategy:epl_under25] ✓ Recovery order RE-PLACED @ ${currentLayPrice} (betId: ${placeRes.betId})`);
+                state.recovery_order_id = placeRes.betId;
+                state.recovery_target_price = currentLayPrice;
+                state.recovery_retry_count = retryCount + 1;
+                state.lay_snapshot = { stake: layStake, price: currentLayPrice };
+                
+                await this.updateTrade(trade.id, {
+                  lay_order_ref: placeRes.betId,
+                  lay_price: currentLayPrice,
+                  lay_size: layStake,
+                  state_data: state,
+                  last_error: null,
+                });
+                
+                await this.logEvent(trade.id, 'RECOVERY_ORDER_RETRIED', {
+                  betId: placeRes.betId,
+                  lay_price: currentLayPrice,
+                  lay_stake: layStake,
+                  retry_attempt: retryCount + 1,
+                  reason: 'ORIGINAL_CANCELLED',
+                  timestamp: new Date().toISOString(),
+                });
+              } else {
+                this.logger.error(`[strategy:epl_under25] Recovery retry FAILED: ${placeRes.errorCode}`);
+                state.recovery_retry_count = retryCount + 1;
+                await this.updateTrade(trade.id, {
+                  state_data: state,
+                  last_error: `RECOVERY_RETRY_FAILED: ${placeRes.errorCode}`,
+                });
+              }
+            }
+          }
+        } else {
+          this.logger.error(`[strategy:epl_under25] ❌ CRITICAL: Recovery order failed after ${maxRetries} retries - POSITION EXPOSED`);
+          await this.updateTrade(trade.id, {
+            last_error: `RECOVERY_FAILED_MAX_RETRIES`,
+            state_data: { ...state, recovery_failed: true },
+          });
+          await this.logEvent(trade.id, 'RECOVERY_FAILED_MAX_RETRIES', {
+            max_retries: maxRetries,
+            back_exposure: trade.back_matched_size || trade.back_size,
+            timestamp: new Date().toISOString(),
+          });
+        }
+        return;
+      }
+      
+      // Check if order was cancelled/lapsed (not EXECUTABLE or EXECUTION_COMPLETE)
+      if (orderDetails.status !== 'EXECUTABLE' && orderDetails.status !== 'EXECUTION_COMPLETE') {
+        this.logger.warn(`[strategy:epl_under25] ⚠️ Recovery order status: ${orderDetails.status} (matched: £${orderDetails.sizeMatched})`);
+        
+        if (orderDetails.sizeMatched > 0) {
+          // Partially matched before cancellation - settle with what matched
+          this.logger.log(`[strategy:epl_under25] Recovery partially matched £${orderDetails.sizeMatched} before cancellation`);
+          
+          state.phase = 'COMPLETED';
+          await this.settleTradeWithPnl(trade, state, {
+            layStakeOverride: orderDetails.sizeMatched,
+            layPriceOverride: orderDetails.averagePriceMatched || state.recovery_target_price,
+          });
+          
+          await this.logEvent(trade.id, 'RECOVERY_PARTIAL_MATCH', {
+            matched_size: orderDetails.sizeMatched,
+            matched_price: orderDetails.averagePriceMatched,
+            status: orderDetails.status,
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+        
+        // No match - RETRY IMMEDIATELY (don't wait for next tick)
+        this.logger.log(`[strategy:epl_under25] Order cancelled with no match - retrying immediately`);
+        
+        const retryCount = state.recovery_retry_count || 0;
+        const maxRetries = 3;
+        
+        if (retryCount < maxRetries) {
+          const book = await this.getMarketBookSafe(market.marketId, sessionToken, 'phase4-cancelled-retry-book');
+          const runner = book?.runners?.find(r => r.selectionId == market.selectionId);
+          const currentLayPrice = runner?.ex?.availableToLay?.[0]?.price;
+          
+          if (currentLayPrice) {
+            const { layStake } = this.calculateHedgeStakeFromBook(book, market.selectionId, trade, currentLayPrice);
+            
+            if (layStake > 0) {
+              const placeRes = await this.placeLimitLaySafe(market.marketId, market.selectionId, layStake, currentLayPrice, sessionToken, 'phase4-cancelled-retry');
+              
+              if (placeRes.status === 'SUCCESS') {
+                this.logger.log(`[strategy:epl_under25] ✓ Recovery order RE-PLACED @ ${currentLayPrice} (betId: ${placeRes.betId})`);
+                state.recovery_order_id = placeRes.betId;
+                state.recovery_target_price = currentLayPrice;
+                state.recovery_retry_count = retryCount + 1;
+                state.lay_snapshot = { stake: layStake, price: currentLayPrice };
+                
+                await this.updateTrade(trade.id, {
+                  lay_order_ref: placeRes.betId,
+                  lay_price: currentLayPrice,
+                  lay_size: layStake,
+                  state_data: state,
+                  last_error: null,
+                });
+                
+                await this.logEvent(trade.id, 'RECOVERY_ORDER_RETRIED', {
+                  betId: placeRes.betId,
+                  lay_price: currentLayPrice,
+                  lay_stake: layStake,
+                  retry_attempt: retryCount + 1,
+                  reason: `ORDER_STATUS_${orderDetails.status}`,
+                  timestamp: new Date().toISOString(),
+                });
+              } else {
+                this.logger.error(`[strategy:epl_under25] Recovery retry FAILED: ${placeRes.errorCode}`);
+                state.recovery_retry_count = retryCount + 1;
+                state.recovery_order_id = null;
+                await this.updateTrade(trade.id, {
+                  state_data: state,
+                  last_error: `RECOVERY_RETRY_FAILED: ${placeRes.errorCode}`,
+                });
+              }
+            }
+          } else {
+            // No lay price - market might still be suspended, wait for next tick
+            this.logger.warn(`[strategy:epl_under25] No lay price available for retry - market may be suspended`);
+            state.recovery_order_id = null;
+            await this.updateTrade(trade.id, { state_data: state });
+          }
+        } else {
+          this.logger.error(`[strategy:epl_under25] ❌ CRITICAL: Recovery order failed after ${maxRetries} retries - POSITION EXPOSED`);
+          await this.updateTrade(trade.id, {
+            last_error: `RECOVERY_FAILED_MAX_RETRIES`,
+            state_data: { ...state, recovery_failed: true },
+          });
+        }
+        return;
+      }
+      
+      if (orderDetails.status === 'EXECUTION_COMPLETE' || (orderDetails.sizeMatched > 0 && orderDetails.sizeRemaining === 0)) {
+        // Verify actual matched size
+        const actualMatchedSize = orderDetails.sizeMatched || 0;
+        const matchedPrice = orderDetails.averagePriceMatched || state.recovery_target_price || trade.lay_price;
+        
         // Recovery lay order matched - log with timestamp
         const recoveryLayMatchedAt = new Date().toISOString();
         await this.logEvent(trade.id, 'LAY_MATCHED', {
           betId: state.recovery_order_id,
-          lay_price: state.recovery_target_price || trade.lay_price,
-          lay_stake: trade.lay_size || trade.lay_matched_size,
+          lay_price: matchedPrice,
+          lay_stake: actualMatchedSize,
           recovery_order: true,
           timestamp: recoveryLayMatchedAt,
         });
         
-        this.logger.log('[strategy:epl_under25] Recovery order matched - Drift Target Reached');
+        this.logger.log(`[strategy:epl_under25] Recovery order matched - Drift Target Reached (£${actualMatchedSize} @ ${matchedPrice})`);
         state.phase = 'COMPLETED';
         await this.settleTradeWithPnl(trade, state, {
-          layStakeOverride: trade.lay_size || trade.lay_matched_size,
-          layPriceOverride: state.recovery_target_price || trade.lay_price,
+          layStakeOverride: actualMatchedSize,
+          layPriceOverride: matchedPrice,
         });
         
         // Trigger smart scheduler to recalculate (trade completed)
@@ -1434,8 +1813,10 @@ class EplUnder25Strategy {
         return;
       }
       
-      // Order is still pending - log status periodically
-      this.logger.log(`[strategy:epl_under25] Recovery: Waiting for drift to ${state.recovery_target_price} (Order: ${state.recovery_order_id})`);
+      // Order is still pending (EXECUTABLE) - log status periodically
+      const pendingMatched = orderDetails.sizeMatched || 0;
+      const pendingRemaining = orderDetails.sizeRemaining || 0;
+      this.logger.log(`[strategy:epl_under25] Recovery: Waiting for drift to ${state.recovery_target_price} (Order: ${state.recovery_order_id}, matched: £${pendingMatched}, remaining: £${pendingRemaining})`);
     }
 
     if (updatedState) {
@@ -1803,28 +2184,24 @@ class EplUnder25Strategy {
       }
 
       // Place lay order with PERSIST (keeps in-play)
+      // GUARDRAIL: Use verification to ensure order is actually placed
       const layPersistence = this.settings.lay_persistence || this.defaults.lay_persistence || 'PERSIST';
-      const layCustomerRef = `LAY-GREENUP-${Date.now()}`;
       
-      const layRes = await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/placeOrders', {
+      const layResult = await this.placeLayOrderWithVerification({
         marketId: trade.betfair_market_id,
-        customerRef: layCustomerRef,
-        instructions: [{
-          selectionId: trade.selection_id,
-          side: 'LAY',
-          orderType: 'LIMIT',
-          limitOrder: {
-            size: layStake,
-            price: targetLayPrice,
-            persistenceType: layPersistence,  // PERSIST = keep in-play
-          },
-        }],
-      }, 'placeLay-greenup');
+        selectionId: trade.selection_id,
+        stake: layStake,
+        price: targetLayPrice,
+        sessionToken,
+        label: 'greenup-lay',
+        persistenceType: layPersistence,
+        maxRetries: 3,
+        verifyDelayMs: 500,
+      });
       
-      const layReport = layRes?.instructionReports?.[0];
-      if (layReport && layReport.status === 'SUCCESS') {
-        const layBetId = layReport.betId;
-        this.logger.log(`[strategy:epl_under25] ✓ LAY ORDER PLACED for green-up: £${layStake} @ ${targetLayPrice} (persistence=${layPersistence}) - betId: ${layBetId}`);
+      if (layResult.status === 'SUCCESS' || layResult.status === 'PARTIAL') {
+        const layBetId = layResult.betId;
+        this.logger.log(`[strategy:epl_under25] ✓ LAY ORDER PLACED for green-up: £${layStake} @ ${targetLayPrice} (persistence=${layPersistence}, verified after ${layResult.attempts} attempts) - betId: ${layBetId}`);
         
         // Calculate expected green-up profit
         const profitIfWins = backMatchedStake * (backMatchedPrice - 1) - layStake * (targetLayPrice - 1);
@@ -1865,6 +2242,7 @@ class EplUnder25Strategy {
           stake: layStake,
           betId: layBetId,
           persistence: layPersistence,
+          verification_attempts: layResult.attempts,
           green_up_calc: {
             back_matched_stake: backMatchedStake,
             back_matched_price: backMatchedPrice,
@@ -1875,8 +2253,8 @@ class EplUnder25Strategy {
         });
         
       } else {
-        const errorCode = layReport?.errorCode || layRes?.errorCode || 'unknown';
-        this.logger.error(`[strategy:epl_under25] ✗ LAY ORDER FAILED: ${errorCode} - trade is exposed!`);
+        const errorCode = layResult.error || 'unknown';
+        this.logger.error(`[strategy:epl_under25] ✗ LAY ORDER FAILED after ${layResult.attempts} attempts: ${errorCode} - trade is exposed!`);
         
         await this.updateTrade(trade.id, {
           status: 'back_matched',

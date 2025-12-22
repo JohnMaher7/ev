@@ -47,15 +47,20 @@ function getDefaultSettings() {
     // Code is the source of truth for this strategy's settings.
     // (Avoid env overrides here to prevent accidental config drift / Supabase "reverts".)
     default_stake: 200,
-    wait_after_goal_seconds: 80,
-    goal_cutoff_minutes: 45,
+    wait_after_goal_seconds: 90,
+    goal_cutoff_minutes: 55,
     min_entry_price: 2.0,
     max_entry_price: 5.5,
     goal_detection_pct: 30,
     
+    // Rolling baseline settings (detect goals vs updated baseline, not kickoff baseline)
+    // Baseline updates when N consecutive polls are within X% of each other (stable market)
+    baseline_stability_pct: 5,        // Prices must be within 5% of each other to be "stable"
+    baseline_stable_readings: 4,      // Need 4 consecutive stable readings (~60s at 15s poll) to update baseline
+    
     // Exit Rules
-    profit_target_pct: 10,
-    stop_loss_pct: 15,
+    profit_target_pct: 12,
+    stop_loss_pct: 20,
     
     // Polling
     in_play_poll_interval_seconds: 15,
@@ -704,32 +709,53 @@ class EplUnder25GoalReactStrategy {
     }
 
     const runner = book.runners?.find(r => r.selectionId == market.selectionId);
-    const currentBackPrice = runner?.ex?.availableToBack?.[0]?.price;
-    const currentLayPrice = runner?.ex?.availableToLay?.[0]?.price;
+    const bestBackPrice = runner?.ex?.availableToBack?.[0]?.price;
+    const bestLayPrice = runner?.ex?.availableToLay?.[0]?.price;
+    const lastTradedPrice = runner?.lastPriceTraded;
+    const signalBackPrice = bestBackPrice || lastTradedPrice; // Use last traded as fallback (e.g. market suspended)
 
-    if (!currentBackPrice || !currentLayPrice) {
-      this.logger.log(`[strategy:${STRATEGY_KEY}] ⚠️ No prices for ${eventName} (back=${currentBackPrice}, lay=${currentLayPrice}) - waiting`);
+    // WATCHING must be able to set baseline + detect goal even when the market is suspended.
+    // Recent behaviour: requiring both best back + best lay can delay baseline until AFTER the goal.
+    if (phase === PHASE.WATCHING) {
+      if (!signalBackPrice) {
+        this.logger.log(
+          `[strategy:${STRATEGY_KEY}] ⚠️ No usable price for ${eventName} (bestBack=${bestBackPrice}, lastTraded=${lastTradedPrice}) - waiting`
+        );
+        return;
+      }
+
+      const spread = (bestBackPrice && bestLayPrice) ? (bestLayPrice - bestBackPrice) : null;
+      this.logger.log(
+        `[strategy:${STRATEGY_KEY}]   Prices: bestBack=${bestBackPrice || 'N/A'} | bestLay=${bestLayPrice || 'N/A'} | lastTraded=${lastTradedPrice || 'N/A'} | spread=${spread != null ? spread.toFixed(2) : 'N/A'}`
+      );
+
+      await this.handleWatching(trade, state, signalBackPrice, bestLayPrice, minsFromKickoff, sessionToken, market);
       return;
     }
-    
+
+    // For all other phases (order placement / spread checks), we require a firm back+lay.
+    if (!bestBackPrice || !bestLayPrice) {
+      this.logger.log(
+        `[strategy:${STRATEGY_KEY}] ⚠️ No prices for ${eventName} (back=${bestBackPrice}, lay=${bestLayPrice}, lastTraded=${lastTradedPrice}) - waiting`
+      );
+      return;
+    }
+
     // Diagnostic: Log current prices
-    this.logger.log(`[strategy:${STRATEGY_KEY}]   Prices: back=${currentBackPrice} | lay=${currentLayPrice} | spread=${(currentLayPrice - currentBackPrice).toFixed(2)}`);
+    this.logger.log(`[strategy:${STRATEGY_KEY}]   Prices: back=${bestBackPrice} | lay=${bestLayPrice} | spread=${(bestLayPrice - bestBackPrice).toFixed(2)}`);
 
     switch (phase) {
-      case PHASE.WATCHING:
-        await this.handleWatching(trade, state, currentBackPrice, currentLayPrice, minsFromKickoff, sessionToken, market);
-        break;
       case PHASE.GOAL_WAIT:
-        await this.handleGoalWait(trade, state, currentBackPrice, currentLayPrice, sessionToken, market);
+        await this.handleGoalWait(trade, state, bestBackPrice, bestLayPrice, sessionToken, market);
         break;
       case PHASE.LIVE:
-        await this.handleLive(trade, state, currentBackPrice, currentLayPrice, sessionToken, market);
+        await this.handleLive(trade, state, bestBackPrice, bestLayPrice, sessionToken, market);
         break;
       case PHASE.STOP_LOSS_WAIT:
-        await this.handleStopLossWait(trade, state, currentBackPrice, currentLayPrice, sessionToken, market);
+        await this.handleStopLossWait(trade, state, bestBackPrice, bestLayPrice, sessionToken, market);
         break;
       case PHASE.STOP_LOSS_ACTIVE:
-        await this.handleStopLossActive(trade, state, currentBackPrice, currentLayPrice, sessionToken, market);
+        await this.handleStopLossActive(trade, state, bestBackPrice, bestLayPrice, sessionToken, market);
         break;
     }
   }
@@ -797,13 +823,16 @@ class EplUnder25GoalReactStrategy {
   async handleWatching(trade, state, backPrice, layPrice, minsFromKickoff, sessionToken, market) {
     const goalCutoff = this.settings?.goal_cutoff_minutes || this.defaults.goal_cutoff_minutes;
     const goalDetectionPct = this.settings?.goal_detection_pct || this.defaults.goal_detection_pct;
+    const stabilityPct = this.settings?.baseline_stability_pct || this.defaults.baseline_stability_pct;
+    const stableReadingsRequired = this.settings?.baseline_stable_readings || this.defaults.baseline_stable_readings;
+    const eventName = trade.event_name || trade.event_id || 'Unknown';
 
-    // Initialize baseline if not set - this is the transition from scheduled → watching
+    // Initialize baseline and price history if not set - transition from scheduled → watching
     if (!state.baseline_price) {
       state.baseline_price = backPrice;
       state.last_price = backPrice;
+      state.recent_prices = [backPrice];  // Start tracking price history
       
-      const eventName = trade.event_name || trade.event_id || 'Unknown';
       this.logger.log(`[strategy:${STRATEGY_KEY}] 👀 WATCHING STARTED: ${eventName} (baseline: ${backPrice}, min: ${minsFromKickoff.toFixed(0)})`);
       
       await this.updateTrade(trade.id, { 
@@ -818,16 +847,63 @@ class EplUnder25GoalReactStrategy {
       return;
     }
 
-    // Check for goal (30% price spike from baseline)
+    // --- Rolling Baseline Update Logic ---
+    // Track recent prices to detect stable market (no goal) vs spike (goal)
+    // If N consecutive readings are within X% of each other, update baseline to current price
+    if (!state.recent_prices) {
+      state.recent_prices = [state.last_price || state.baseline_price];
+    }
+    
+    // Add current price to history (keep last N readings)
+    state.recent_prices.push(backPrice);
+    if (state.recent_prices.length > stableReadingsRequired) {
+      state.recent_prices.shift();  // Remove oldest, keep last N
+    }
+    
+    // Check if market is stable: all recent prices within stabilityPct% of the median
+    let baselineUpdated = false;
+    if (state.recent_prices.length >= stableReadingsRequired) {
+      const sorted = [...state.recent_prices].sort((a, b) => a - b);
+      const median = sorted[Math.floor(sorted.length / 2)];
+      
+      // Check if ALL prices are within stabilityPct% of the median
+      const allStable = state.recent_prices.every(p => {
+        const deviation = Math.abs((p - median) / median) * 100;
+        return deviation <= stabilityPct;
+      });
+      
+      if (allStable) {
+        const oldBaseline = state.baseline_price;
+        // Only log update if baseline actually changed meaningfully (>1% difference)
+        const baselineDrift = Math.abs((backPrice - oldBaseline) / oldBaseline) * 100;
+        
+        if (baselineDrift > 1) {
+          state.baseline_price = backPrice;
+          baselineUpdated = true;
+          this.logger.log(`[strategy:${STRATEGY_KEY}] 📊 BASELINE UPDATED: ${eventName} | ${oldBaseline.toFixed(2)} → ${backPrice.toFixed(2)} (drift: ${baselineDrift.toFixed(1)}%, stable for ${stableReadingsRequired} readings)`);
+          
+          await this.logEvent(trade.id, 'BASELINE_UPDATED', {
+            old_baseline: oldBaseline,
+            new_baseline: backPrice,
+            drift_pct: Number(baselineDrift.toFixed(1)),
+            recent_prices: [...state.recent_prices],
+            mins_from_kickoff: minsFromKickoff,
+            timestamp: new Date().toISOString(),
+          });
+        }
+      }
+    }
+
+    // --- Goal Detection (vs updated baseline) ---
     const priceChangeFromBaseline = ((backPrice - state.baseline_price) / state.baseline_price) * 100;
     
     // Calculate change from PREVIOUS poll (for logging clarity)
     const previousPrice = state.last_price || state.baseline_price;
     const priceChangeFromPrevious = ((backPrice - previousPrice) / previousPrice) * 100;
     
-    // Diagnostic: Log price vs PREVIOUS poll (easier to monitor)
-    const eventName = trade.event_name || trade.event_id || 'Unknown';
-    this.logger.log(`[strategy:${STRATEGY_KEY}]   WATCHING ${eventName}: price=${backPrice} | prev=${previousPrice} | change=${priceChangeFromPrevious.toFixed(1)}% | vs_baseline=${priceChangeFromBaseline.toFixed(1)}% | threshold=${goalDetectionPct}%`);
+    // Diagnostic log (include baseline status)
+    const baselineStatus = baselineUpdated ? ' [BASELINE_UPDATED]' : '';
+    this.logger.log(`[strategy:${STRATEGY_KEY}]   WATCHING ${eventName}: price=${backPrice} | baseline=${state.baseline_price.toFixed(2)} | vs_baseline=${priceChangeFromBaseline.toFixed(1)}% | threshold=${goalDetectionPct}%${baselineStatus}`);
     
     if (priceChangeFromBaseline >= goalDetectionPct) {
       this.logger.log(`[strategy:${STRATEGY_KEY}] 🎯 GOAL DETECTED! Price spike: ${priceChangeFromBaseline.toFixed(1)}% from baseline (${state.baseline_price} → ${backPrice})`);
@@ -851,11 +927,12 @@ class EplUnder25GoalReactStrategy {
         return;
       }
 
-      // Move to GOAL_WAIT
+      // Move to GOAL_WAIT - clear recent_prices (not needed during GOAL_WAIT)
       state.phase = PHASE.GOAL_WAIT;
       state.spike_detected_at = Date.now();
       state.spike_price = backPrice;
       state.goal_number = 1;
+      state.recent_prices = [];  // Reset price history
       // Initialize snapshot flags for price logging at t+30/60/90/120 seconds
       state.goal_snapshot_flags = { s30: false, s60: false, s90: false, s120: false };
       
@@ -876,7 +953,7 @@ class EplUnder25GoalReactStrategy {
       return;
     }
 
-    // Update baseline slowly (to track gradual drift)
+    // Update last_price for next poll comparison
     state.last_price = backPrice;
     await this.updateTrade(trade.id, { state_data: state });
   }
@@ -1086,6 +1163,17 @@ class EplUnder25GoalReactStrategy {
         if (retryRes.status === 'SUCCESS') {
           this.logger.log(`[strategy:${STRATEGY_KEY}] ✓ RETRY BACK PLACED @ ${retryPrice} - betId: ${retryRes.betId}`);
           
+          // CRITICAL FIX: Store retry bet ID in state for tracking and cancellation
+          if (!state.retry_back_bet_ids) {
+            state.retry_back_bet_ids = [];
+          }
+          state.retry_back_bet_ids.push({
+            betId: retryRes.betId,
+            placedAt: Date.now(),
+            amount: backRemainingSize,
+            price: retryPrice,
+          });
+          
           // Wait briefly for retry to match (5s, already at aggressive price)
           const retryWaitMs = 5000;
           let retryElapsed = 0;
@@ -1109,13 +1197,29 @@ class EplUnder25GoalReactStrategy {
             retryElapsed += 500;
           }
           
-          // Cancel any remaining retry amount
+          // CRITICAL FIX: Always cancel unmatched retry portion, verify cancellation succeeded
           if (retryElapsed >= retryWaitMs) {
             const finalRetryCheck = await this.getOrderDetailsSafe(retryRes.betId, sessionToken, 'final-retry-check');
             if (finalRetryCheck && finalRetryCheck.sizeRemaining > 0) {
+              this.logger.log(`[strategy:${STRATEGY_KEY}] Cancelling unmatched retry portion: £${finalRetryCheck.sizeRemaining} of bet ${retryRes.betId}`);
               await this.cancelOrderSafe(retryRes.betId, sessionToken, 'cancel-unmatched-retry');
+              
+              // Verify cancellation succeeded
+              await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1s for cancellation to process
+              const verifyCancel = await this.getOrderDetailsSafe(retryRes.betId, sessionToken, 'verify-retry-cancel');
+              if (verifyCancel && verifyCancel.sizeRemaining > 0) {
+                this.logger.warn(`[strategy:${STRATEGY_KEY}] ⚠️ Retry bet ${retryRes.betId} still has unmatched portion after cancel - will retry cancellation`);
+                // Retry cancellation
+                await this.cancelOrderSafe(retryRes.betId, sessionToken, 'cancel-unmatched-retry-retry');
+              } else {
+                this.logger.log(`[strategy:${STRATEGY_KEY}] ✓ Retry bet ${retryRes.betId} cancellation verified`);
+              }
+              
               retryMatchedSize = finalRetryCheck.sizeMatched || 0;
               retryMatchedPrice = finalRetryCheck.averagePriceMatched || retryPrice;
+            } else if (finalRetryCheck && finalRetryCheck.sizeRemaining === 0) {
+              // Fully matched - remove from tracking
+              state.retry_back_bet_ids = state.retry_back_bet_ids.filter(b => b.betId !== retryRes.betId);
             }
           }
           
@@ -1296,6 +1400,64 @@ class EplUnder25GoalReactStrategy {
       await this.updateTrade(trade.id, { state_data: state });
     }
     
+    // CRITICAL FIX (ISSUE 1): Cancel unmatched back bets after timeout period
+    const unmatchedBetTimeoutMs = 60000; // 60 seconds timeout for unmatched bets
+    const now = Date.now();
+    
+    // Check original back bet
+    const originalBackBetId = state.back_bet_id || trade.back_order_ref;
+    if (originalBackBetId && state.entry_time) {
+      const backBetAge = now - state.entry_time;
+      if (backBetAge > unmatchedBetTimeoutMs) {
+        const backOrderDetails = await this.getOrderDetailsSafe(originalBackBetId, sessionToken, 'check-unmatched-back');
+        if (backOrderDetails && backOrderDetails.sizeRemaining > 0) {
+          this.logger.log(`[strategy:${STRATEGY_KEY}] ⚠️ Original back bet ${originalBackBetId} still has unmatched portion (£${backOrderDetails.sizeRemaining}) after ${(backBetAge/1000).toFixed(0)}s - cancelling`);
+          await this.cancelOrderSafe(originalBackBetId, sessionToken, 'cancel-unmatched-back-timeout');
+          await this.logEvent(trade.id, 'BACK_CANCELLED_TIMEOUT', {
+            bet_id: originalBackBetId,
+            unmatched_size: backOrderDetails.sizeRemaining,
+            age_seconds: Math.round(backBetAge / 1000),
+            timestamp: new Date().toISOString(),
+          });
+        }
+      }
+    }
+    
+    // Check retry back bets
+    if (state.retry_back_bet_ids && Array.isArray(state.retry_back_bet_ids)) {
+      const betsToRemove = [];
+      for (const retryBet of state.retry_back_bet_ids) {
+        const retryBetAge = now - retryBet.placedAt;
+        if (retryBetAge > unmatchedBetTimeoutMs) {
+          const retryOrderDetails = await this.getOrderDetailsSafe(retryBet.betId, sessionToken, 'check-unmatched-retry');
+          if (retryOrderDetails) {
+            if (retryOrderDetails.sizeRemaining > 0) {
+              this.logger.log(`[strategy:${STRATEGY_KEY}] ⚠️ Retry back bet ${retryBet.betId} still has unmatched portion (£${retryOrderDetails.sizeRemaining}) after ${(retryBetAge/1000).toFixed(0)}s - cancelling`);
+              await this.cancelOrderSafe(retryBet.betId, sessionToken, 'cancel-unmatched-retry-timeout');
+              await this.logEvent(trade.id, 'RETRY_BACK_CANCELLED_TIMEOUT', {
+                bet_id: retryBet.betId,
+                unmatched_size: retryOrderDetails.sizeRemaining,
+                age_seconds: Math.round(retryBetAge / 1000),
+                timestamp: new Date().toISOString(),
+              });
+            }
+            // Remove from tracking if fully matched or cancelled
+            if (retryOrderDetails.status === 'EXECUTION_COMPLETE' || retryOrderDetails.sizeRemaining === 0) {
+              betsToRemove.push(retryBet.betId);
+            }
+          } else {
+            // Order not found - remove from tracking
+            betsToRemove.push(retryBet.betId);
+          }
+        }
+      }
+      // Clean up tracked bets
+      if (betsToRemove.length > 0) {
+        state.retry_back_bet_ids = state.retry_back_bet_ids.filter(b => !betsToRemove.includes(b.betId));
+        await this.updateTrade(trade.id, { state_data: state });
+      }
+    }
+    
     const entryPrice = state.entry_price;
     const layBetId = state.lay_bet_id || trade.lay_order_ref;
     
@@ -1377,11 +1539,94 @@ class EplUnder25GoalReactStrategy {
     if (spikeFromStable >= goalDetectionPct) {
       this.logger.log(`[strategy:${STRATEGY_KEY}] ⚠️ 2ND GOAL DETECTED! Spike: ${spikeFromStable.toFixed(1)}%`);
       
-      // Cancel existing lay order before entering stop-loss mode
+      // CRITICAL FIX (ISSUE 2): Cancel existing lay order and verify cancellation succeeded
       if (layBetId) {
         this.logger.log(`[strategy:${STRATEGY_KEY}] Cancelling profit lay order ${layBetId} due to 2nd goal`);
+        
+        // Cancel the lay order
         await this.cancelOrderSafe(layBetId, sessionToken, 'cancel-lay-2nd-goal');
+        
+        // CRITICAL: Wait briefly then verify cancellation succeeded
+        await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2s for cancellation to process
+        
+        const orderDetails = await this.getOrderDetailsSafe(layBetId, sessionToken, 'verify-lay-after-2nd-goal');
+        const expectedLaySize = state.lay_snapshot?.stake || trade.lay_size || 0;
+        
+        if (orderDetails) {
+          const matchedSize = orderDetails.sizeMatched || 0;
+          const matchedPrice = orderDetails.averagePriceMatched || state.target_lay_price || trade.lay_price;
+          
+          // Check if cancellation actually succeeded
+          if (orderDetails.status === 'EXECUTABLE' && orderDetails.sizeRemaining > 0) {
+            // Cancellation failed - retry cancellation
+            this.logger.warn(`[strategy:${STRATEGY_KEY}] ⚠️ Lay order ${layBetId} still executable after cancel - retrying cancellation`);
+            await this.cancelOrderSafe(layBetId, sessionToken, 'cancel-lay-2nd-goal-retry');
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            // Check again
+            const retryCheck = await this.getOrderDetailsSafe(layBetId, sessionToken, 'verify-lay-after-retry-cancel');
+            if (retryCheck && retryCheck.status === 'EXECUTABLE' && retryCheck.sizeRemaining > 0) {
+              this.logger.error(`[strategy:${STRATEGY_KEY}] ❌ CRITICAL: Lay order ${layBetId} FAILED to cancel after 2 attempts - manual intervention required!`);
+              await this.logEvent(trade.id, 'LAY_CANCEL_FAILED', {
+                lay_bet_id: layBetId,
+                remaining_size: retryCheck.sizeRemaining,
+                timestamp: new Date().toISOString(),
+              });
+            }
+          }
+          
+          // Scenario 1: Fully matched - trade is complete with profit!
+          if (orderDetails.status === 'EXECUTION_COMPLETE' || (matchedSize > 0 && orderDetails.sizeRemaining === 0)) {
+            this.logger.log(`[strategy:${STRATEGY_KEY}] 🏆 LAY WAS FULLY MATCHED during 2nd goal! £${matchedSize} @ ${matchedPrice} - settling as WIN`);
+            
+            state.phase = PHASE.COMPLETED;
+            state.exit_price = matchedPrice;
+            state.exit_time = Date.now();
+            state.exit_reason = 'PROFIT_TARGET_DURING_GOAL';
+            
+            await this.settleTradeWithPnl(trade, state, 'WIN', { layPrice: matchedPrice, layStake: matchedSize });
+            await this.logEvent(trade.id, 'LAY_MATCHED_DURING_GOAL', {
+              lay_bet_id: layBetId,
+              matched_size: matchedSize,
+              matched_price: matchedPrice,
+              goal_number: 2,
+              timestamp: new Date().toISOString(),
+            });
+            return;
+          }
+          
+          // Scenario 2: Partially matched - record partial match, continue to stop-loss for remaining
+          if (matchedSize > 0 && matchedSize < expectedLaySize) {
+            this.logger.log(`[strategy:${STRATEGY_KEY}] ⚠️ LAY PARTIALLY MATCHED: £${matchedSize} of £${expectedLaySize} @ ${matchedPrice}`);
+            this.logger.log(`[strategy:${STRATEGY_KEY}]   Remaining unhedged exposure: £${(expectedLaySize - matchedSize).toFixed(2)} - proceeding to stop-loss`);
+            
+            // Store partial match info for stop-loss calculation
+            state.partial_lay_matched = matchedSize;
+            state.partial_lay_price = matchedPrice;
+            
+            await this.logEvent(trade.id, 'LAY_PARTIAL_MATCH_ON_GOAL', {
+              lay_bet_id: layBetId,
+              matched_size: matchedSize,
+              expected_size: expectedLaySize,
+              matched_price: matchedPrice,
+              remaining_exposure: expectedLaySize - matchedSize,
+              goal_number: 2,
+              timestamp: new Date().toISOString(),
+            });
+            // Continue to stop-loss below
+          } else {
+            // Scenario 3: Not matched at all - full exposure remains
+            this.logger.log(`[strategy:${STRATEGY_KEY}] Lay order cancelled successfully (no matches) - full exposure remains`);
+          }
+        } else {
+          // Order not found - likely cancelled successfully
+          this.logger.log(`[strategy:${STRATEGY_KEY}] ✓ Lay order ${layBetId} not found after cancel - cancellation verified`);
+        }
       }
+      
+      // CRITICAL FIX (ISSUE 2): Move to STOP_LOSS_WAIT to wait 90s for market to settle
+      // After 90s wait, we'll set baseline and place stop loss bet at calculated price (20% below baseline)
+      this.logger.log(`[strategy:${STRATEGY_KEY}] ⚠️ 2ND GOAL DETECTED - waiting 90s for market to settle before placing stop loss`);
       
       state.phase = PHASE.STOP_LOSS_WAIT;
       state.second_goal_spike_at = Date.now();
@@ -1396,6 +1641,8 @@ class EplUnder25GoalReactStrategy {
         spike_price: backPrice,
         last_stable_price: lastStablePrice,
         spike_pct: spikeFromStable,
+        partial_lay_matched: state.partial_lay_matched || 0,
+        partial_lay_price: state.partial_lay_price || 0,
         timestamp: new Date().toISOString(),
       });
       return;
@@ -1434,57 +1681,143 @@ class EplUnder25GoalReactStrategy {
 
   async handleStopLossActive(trade, state, backPrice, layPrice, sessionToken, market) {
     const stopLossPct = this.settings?.stop_loss_pct || this.defaults.stop_loss_pct;
-    
     const baseline = state.stop_loss_baseline;
-    const dropFromBaseline = ((baseline - backPrice) / baseline) * 100;
     
-    // Exit when price drops 15% below settled price
-    if (dropFromBaseline >= stopLossPct) {
-      this.logger.log(`[strategy:${STRATEGY_KEY}] 🛑 STOP LOSS EXIT! Price dropped ${dropFromBaseline.toFixed(1)}% from baseline`);
+    if (!baseline) {
+      this.logger.warn(`[strategy:${STRATEGY_KEY}] ⚠️ No stop loss baseline set - cannot place stop loss bet`);
+      return;
+    }
+    
+    // CRITICAL FIX (ISSUE 2): Place stop loss bet immediately at calculated price (20% below baseline)
+    // After 90s wait, baseline is set - now place stop loss bet at baseline * (1 - stopLossPct/100)
+    if (!state.stop_loss_lay_placed) {
+      // Calculate stop loss price: baseline * (1 - stopLossPct/100)
+      // Example: baseline=3.0, stopLossPct=20% → stopLossPrice = 3.0 * 0.8 = 2.4
+      const stopLossPrice = roundToBetfairTick(baseline * (1 - stopLossPct / 100));
       
-      const stake = trade.back_stake || trade.back_size;
+      this.logger.log(`[strategy:${STRATEGY_KEY}] 🛑 Placing stop loss bet at calculated price: ${stopLossPrice} (baseline: ${baseline}, ${stopLossPct}% below)`);
+      
+      const fullBackStake = trade.back_stake || trade.back_size;
       const entryPrice = state.entry_price;
+      const commission = this.settings?.commission_rate || this.defaults.commission_rate;
+      
+      // Check for partial lay match from cancelled profit target (2nd goal scenario)
+      const partialLayMatched = state.partial_lay_matched || 0;
+      const partialLayPrice = state.partial_lay_price || 0;
+      
+      // Calculate remaining unhedged back exposure
+      let remainingBackExposure = fullBackStake;
+      if (partialLayMatched > 0 && partialLayPrice > 0) {
+        const hedgedBackAmount = (partialLayMatched * partialLayPrice) / entryPrice;
+        remainingBackExposure = fullBackStake - hedgedBackAmount;
+        this.logger.log(`[strategy:${STRATEGY_KEY}] Partial lay already hedged £${hedgedBackAmount.toFixed(2)} of back`);
+        this.logger.log(`[strategy:${STRATEGY_KEY}] Remaining unhedged exposure: £${remainingBackExposure.toFixed(2)} (of £${fullBackStake})`);
+      }
+      
+      // Calculate lay stake for remaining exposure at stop loss price
       const { layStake } = calculateLayStake({
-        backStake: stake,
+        backStake: remainingBackExposure,
         backPrice: entryPrice,
-        layPrice: backPrice,
-        commission: this.settings?.commission_rate || this.defaults.commission_rate,
+        layPrice: stopLossPrice,
+        commission,
       });
+      
+      this.logger.log(`[strategy:${STRATEGY_KEY}] Placing stop-loss LAY: £${layStake.toFixed(2)} @ ${stopLossPrice} (${stopLossPct}% below baseline ${baseline})`);
       
       const layRes = await this.placeLimitOrderSafe(
         market.marketId,
         market.selectionId,
         'LAY',
         layStake,
-        backPrice,
+        stopLossPrice,
         sessionToken,
-        'goalreact-stoploss-exit'
+        'goalreact-stoploss'
       );
       
       if (layRes.status === 'SUCCESS') {
-        state.phase = PHASE.COMPLETED;
-        state.exit_price = backPrice;
-        state.exit_time = Date.now();
-        state.exit_reason = 'STOP_LOSS';
+        state.stop_loss_lay_placed = true;
+        state.stop_loss_lay_bet_id = layRes.betId;
+        state.stop_loss_lay_stake = layStake;
+        state.stop_loss_lay_price = stopLossPrice;
         
-        const stopLossExitAt = new Date().toISOString();
-        await this.settleTradeWithPnl(trade, state, 'STOP_LOSS', { layPrice: backPrice, layStake });
-        await this.logEvent(trade.id, 'STOP_LOSS_EXIT', { 
-          price_entered: state.entry_price,
-          price_exited: backPrice,
-          entry_price: state.entry_price,
-          exit_price: backPrice,
-          stop_loss_baseline: baseline,
-          drop_pct: dropFromBaseline,
-          stop_loss_pct: stopLossPct,
-          lay_bet_id: layRes.betId,
-          timestamp: stopLossExitAt,
+        await this.updateTrade(trade.id, {
+          state_data: state,
+          lay_order_ref: layRes.betId,
+          lay_price: stopLossPrice,
+          lay_size: layStake,
+          lay_placed_at: new Date().toISOString(),
         });
+        
+        await this.logEvent(trade.id, 'STOP_LOSS_LAY_PLACED', {
+          lay_bet_id: layRes.betId,
+          lay_price: stopLossPrice,
+          lay_stake: layStake,
+          baseline_price: baseline,
+          stop_loss_pct: stopLossPct,
+          remaining_exposure: remainingBackExposure,
+          full_back_stake: fullBackStake,
+          partial_lay_matched: partialLayMatched,
+          timestamp: new Date().toISOString(),
+        });
+        
+        this.logger.log(`[strategy:${STRATEGY_KEY}] ✓ Stop loss lay placed: ${layRes.betId} @ ${stopLossPrice} (${stopLossPct}% below baseline)`);
+      } else {
+        this.logger.error(`[strategy:${STRATEGY_KEY}] ❌ Stop-loss LAY FAILED: ${layRes.errorCode} - POSITION STILL EXPOSED!`);
+        await this.logEvent(trade.id, 'STOP_LOSS_LAY_FAILED', {
+          errorCode: layRes.errorCode,
+          attempted_stake: layStake,
+          attempted_price: stopLossPrice,
+          baseline: baseline,
+          stop_loss_pct: stopLossPct,
+          timestamp: new Date().toISOString(),
+        });
+        // Don't return - continue to monitor and retry if needed
       }
-      return;
     }
-
-    this.logger.log(`[strategy:${STRATEGY_KEY}] STOP_LOSS_ACTIVE: waiting for ${stopLossPct}% drop (current: ${dropFromBaseline.toFixed(1)}%)`);
+    
+    // Check if stop loss lay has matched (exit condition)
+    if (state.stop_loss_lay_bet_id) {
+      const stopLossLayDetails = await this.getOrderDetailsSafe(state.stop_loss_lay_bet_id, sessionToken, 'check-stop-loss-lay');
+      if (stopLossLayDetails) {
+        if (stopLossLayDetails.status === 'EXECUTION_COMPLETE' || (stopLossLayDetails.sizeMatched > 0 && stopLossLayDetails.sizeRemaining === 0)) {
+          // Stop loss lay matched - trade complete
+          const matchedSize = stopLossLayDetails.sizeMatched || state.stop_loss_lay_stake || 0;
+          const matchedPrice = stopLossLayDetails.averagePriceMatched || state.stop_loss_lay_price || backPrice;
+          
+          this.logger.log(`[strategy:${STRATEGY_KEY}] 🏁 Stop loss lay MATCHED: £${matchedSize} @ ${matchedPrice} - trade complete`);
+          
+          state.phase = PHASE.COMPLETED;
+          state.exit_price = matchedPrice;
+          state.exit_time = Date.now();
+          state.exit_reason = 'STOP_LOSS';
+          
+          const partialLayMatched = state.partial_lay_matched || 0;
+          const partialLayPrice = state.partial_lay_price || 0;
+          
+          await this.settleTradeWithPnl(trade, state, 'STOP_LOSS', {
+            layPrice: matchedPrice,
+            layStake: matchedSize,
+            partialLayMatched,
+            partialLayPrice,
+          });
+          
+          await this.logEvent(trade.id, 'STOP_LOSS_COMPLETE', {
+            lay_bet_id: state.stop_loss_lay_bet_id,
+            matched_size: matchedSize,
+            matched_price: matchedPrice,
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+      }
+    }
+    
+    // Monitor stop loss bet - log status
+    if (baseline) {
+      const dropFromBaseline = ((baseline - backPrice) / baseline) * 100;
+      const stopLossPrice = state.stop_loss_lay_price || roundToBetfairTick(baseline * (1 - stopLossPct / 100));
+      this.logger.log(`[strategy:${STRATEGY_KEY}] STOP_LOSS_ACTIVE: monitoring (baseline: ${baseline}, current: ${backPrice}, stop_loss_price: ${stopLossPrice}, drop: ${dropFromBaseline.toFixed(1)}%)`);
+    }
   }
 
   // --- Emergency Hedge ---
@@ -1613,24 +1946,51 @@ class EplUnder25GoalReactStrategy {
   }
 
   async settleTradeWithPnl(trade, state, reason, options = {}) {
-    const { layPrice, layStake } = options;
+    const { layPrice, layStake, partialLayMatched = 0, partialLayPrice = 0 } = options;
     
     const commission = this.settings?.commission_rate || this.defaults.commission_rate;
-    const backStake = trade.back_stake || trade.back_size || 0;
-    const backPrice = state.entry_price || trade.back_price || 0;
+    // FIX: Use matched sizes as source of truth (actual amounts that were matched)
+    const backStake = trade.back_matched_size || trade.back_stake || trade.back_size || 0;
+    // CRITICAL FIX: Prioritize trade.back_price (actual matched price) over state.entry_price (order placement price)
+    // trade.back_price contains the verified matched price from Betfair, which is the source of truth for P&L
+    const backPrice = trade.back_price || state.entry_price || 0;
     const eventName = trade.event_name || trade.event_id || 'Unknown';
+    
+    // Calculate aggregate lay position (partial match + main lay)
+    // This handles the scenario where partial lay matched during 2nd goal cancellation
+    // FIX: Use matched size as source of truth, fallback to parameter or trade record
+    let aggregateLayStake = layStake || trade.lay_matched_size || trade.lay_size || 0;
+    let aggregateLayPrice = layPrice || trade.lay_price || 0;
+    
+    if (partialLayMatched > 0 && partialLayPrice > 0) {
+      // Combine partial match with stop-loss lay
+      const totalLayStake = partialLayMatched + (layStake || 0);
+      
+      if (totalLayStake > 0) {
+        // Weighted average price
+        aggregateLayPrice = (
+          (partialLayMatched * partialLayPrice) + ((layStake || 0) * (layPrice || 0))
+        ) / totalLayStake;
+        aggregateLayStake = totalLayStake;
+      }
+      
+      this.logger.log(`[strategy:${STRATEGY_KEY}] Aggregating lay positions:`);
+      this.logger.log(`[strategy:${STRATEGY_KEY}]   Partial: £${partialLayMatched.toFixed(2)} @ ${partialLayPrice.toFixed(2)}`);
+      this.logger.log(`[strategy:${STRATEGY_KEY}]   Stop-loss: £${(layStake || 0).toFixed(2)} @ ${(layPrice || 0).toFixed(2)}`);
+      this.logger.log(`[strategy:${STRATEGY_KEY}]   Aggregate: £${aggregateLayStake.toFixed(2)} @ ${aggregateLayPrice.toFixed(2)} (weighted avg)`);
+    }
     
     // Validation logging
     this.logger.log(`[strategy:${STRATEGY_KEY}] Settlement calc for ${eventName}:`);
     this.logger.log(`[strategy:${STRATEGY_KEY}]   Back: £${backStake} @ ${backPrice}`);
-    this.logger.log(`[strategy:${STRATEGY_KEY}]   Lay:  £${layStake || 0} @ ${layPrice || 0}`);
+    this.logger.log(`[strategy:${STRATEGY_KEY}]   Lay:  £${aggregateLayStake.toFixed(2)} @ ${aggregateLayPrice.toFixed(2)}`);
     this.logger.log(`[strategy:${STRATEGY_KEY}]   Reason: ${reason}`);
     
     const realised = computeRealisedPnlSnapshot({
       backStake,
       backPrice,
-      layStake: layStake || 0,
-      layPrice: layPrice || 0,
+      layStake: aggregateLayStake,
+      layPrice: aggregateLayPrice,
       commission,
     });
 
@@ -1642,13 +2002,13 @@ class EplUnder25GoalReactStrategy {
     await this.updateTrade(trade.id, {
       status: 'completed',
       state_data: state,
-      lay_price: layPrice || null,
-      lay_size: layStake || null,
-      lay_matched_size: layStake || null,
+      lay_price: aggregateLayPrice || null,
+      lay_size: aggregateLayStake || null,
+      lay_matched_size: aggregateLayStake || null,
       realised_pnl: realised,  // May be null
       pnl: realised,
       settled_at: new Date().toISOString(),
-      total_stake: backStake + (layStake || 0),
+      total_stake: backStake + aggregateLayStake,
       last_error: reason === 'MARKET_CLOSED' ? reason : null,
     });
 

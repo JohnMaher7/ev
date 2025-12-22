@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useMemo, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -56,6 +56,26 @@ interface TradeEvent {
   payload: Record<string, unknown>;
 }
 
+interface ExposureStat {
+  strategy_key: string;
+  setting_key: 'lay_ticks_below_back' | 'profit_target_pct';
+  setting_value: number;
+  average_exposure_seconds: number;
+  total_trades: number;
+  losing_trades_excluded: number;
+  net_pnl: number;
+}
+
+interface StrategyStatsResponse {
+  summary: { totalStaked: number; totalTrades: number; pnl: number };
+  competitions: Array<{ name: string; pnl: number; trades: number; staked: number }>;
+}
+
+interface TradesPage {
+  data: StrategyTrade[];
+  cursor: string | null;
+}
+
 // Strategy display names
 const STRATEGY_NAMES: Record<string, string> = {
   epl_under25: 'Pre-Match Hedge',
@@ -94,6 +114,13 @@ export default function EplUnder25View() {
   const [competitionFilter, setCompetitionFilter] = useState("");
   const [dateFilter, setDateFilter] = useState("");
   const [expandedTrades, setExpandedTrades] = useState<Set<string>>(new Set());
+  const [activeExposureBox, setActiveExposureBox] = useState<{
+    strategy_key: string;
+    setting_key: ExposureStat["setting_key"];
+    setting_value: number;
+  } | null>(null);
+  const [activeExposureBoxLoading, setActiveExposureBoxLoading] = useState(false);
+  const [savedStatusFilter, setSavedStatusFilter] = useState<string | null>(null);
 
   // Fetch competition names separately
   const competitionNamesQuery = useQuery({
@@ -110,12 +137,25 @@ export default function EplUnder25View() {
     },
   });
 
-  const tradesQuery = useQuery({
-    queryKey: ["strategy-trades", "epl-under25", statusFilter, strategyFilter, competitionFilter, dateFilter],
-    queryFn: async () => {
+  const activeExposureBoxKey = activeExposureBox
+    ? `${activeExposureBox.strategy_key}|${activeExposureBox.setting_key}|${activeExposureBox.setting_value}`
+    : "";
+
+  const tradesQuery = useInfiniteQuery({
+    queryKey: ["strategy-trades", "epl-under25", "trades", statusFilter, strategyFilter, competitionFilter, dateFilter, activeExposureBoxKey],
+    initialPageParam: null as string | null,
+    queryFn: async ({ pageParam }) => {
       const params = new URLSearchParams();
-      if (statusFilter) params.set("status", statusFilter);
-      if (strategyFilter) params.set("strategy_key", strategyFilter);
+      if (activeExposureBoxKey === "" && statusFilter) params.set("status", statusFilter);
+
+      if (activeExposureBoxKey !== "" && activeExposureBox) {
+        params.set("strategy_key", activeExposureBox.strategy_key);
+        params.set("box_setting_key", activeExposureBox.setting_key);
+        params.set("box_setting_value", String(activeExposureBox.setting_value));
+      } else if (strategyFilter) {
+        params.set("strategy_key", strategyFilter);
+      }
+
       if (competitionFilter) params.set("competition_name", competitionFilter);
       if (dateFilter) {
         // Set date_from to the selected date (start of day)
@@ -123,11 +163,57 @@ export default function EplUnder25View() {
         // Set date_to to end of the selected day
         params.set("date_to", new Date(dateFilter).toISOString().split('T')[0] + 'T23:59:59.999Z');
       }
+      params.set("limit", "200");
+
+      if (pageParam) {
+        params.set("cursor", pageParam);
+      }
+
       const res = await fetch(`/api/strategies/epl-under25/trades?${params}`);
       if (!res.ok) throw new Error("Failed to load trades");
       const json = await res.json();
       if (!json.success) throw new Error(json.error || "Failed to load trades");
-      return json.data as StrategyTrade[];
+      return { data: (json.data as StrategyTrade[]) ?? [], cursor: (json.cursor as string | null) ?? null } satisfies TradesPage;
+    },
+    getNextPageParam: (lastPage) => lastPage.cursor ?? undefined,
+  });
+
+  const statsQuery = useQuery({
+    queryKey: ["strategy-trades", "epl-under25", "stats", strategyFilter, competitionFilter, dateFilter],
+    queryFn: async () => {
+      const params = new URLSearchParams();
+      // NOTE: statusFilter must not impact totals.
+      if (strategyFilter) params.set("strategy_key", strategyFilter);
+      if (competitionFilter) params.set("competition_name", competitionFilter);
+      if (dateFilter) {
+        params.set("date_from", new Date(dateFilter).toISOString().split('T')[0] + 'T00:00:00.000Z');
+        params.set("date_to", new Date(dateFilter).toISOString().split('T')[0] + 'T23:59:59.999Z');
+      }
+      const res = await fetch(`/api/strategies/epl-under25/stats?${params}`);
+      if (!res.ok) throw new Error("Failed to load totals");
+      const json = await res.json();
+      if (!json.success) throw new Error(json.error || "Failed to load totals");
+      return json.data as StrategyStatsResponse;
+    },
+  });
+
+  const exposureStatsQuery = useQuery({
+    queryKey: ["strategy-trades", "epl-under25", "exposure-stats", strategyFilter, competitionFilter, dateFilter],
+    queryFn: async () => {
+      const params = new URLSearchParams();
+      // NOTE: exposure stats are meaningful only for settled trades; we intentionally
+      // do not apply statusFilter here.
+      if (strategyFilter) params.set("strategy_key", strategyFilter);
+      if (competitionFilter) params.set("competition_name", competitionFilter);
+      if (dateFilter) {
+        params.set("date_from", new Date(dateFilter).toISOString().split('T')[0] + 'T00:00:00.000Z');
+        params.set("date_to", new Date(dateFilter).toISOString().split('T')[0] + 'T23:59:59.999Z');
+      }
+      const res = await fetch(`/api/strategies/epl-under25/exposure-stats?${params}`);
+      if (!res.ok) throw new Error("Failed to load exposure stats");
+      const json = await res.json();
+      if (!json.success) throw new Error(json.error || "Failed to load exposure stats");
+      return json.data as ExposureStat[];
     },
   });
 
@@ -162,7 +248,9 @@ export default function EplUnder25View() {
     },
   });
 
-  const trades = useMemo(() => tradesQuery.data ?? [], [tradesQuery.data]);
+  const trades = useMemo(() => {
+    return (tradesQuery.data?.pages ?? []).flatMap((p) => p.data);
+  }, [tradesQuery.data]);
 
   // Use competition names from the separate query (all competitions, not just loaded trades)
   const competitionNames = useMemo(() => {
@@ -170,43 +258,37 @@ export default function EplUnder25View() {
   }, [competitionNamesQuery.data]);
 
   const summary = useMemo(() => {
-    return trades.reduce(
-      (acc, trade) => {
-        // Only count trades that were actually taken (back bet placed/matched)
-        if (isTakenTrade(trade)) {
-          acc.totalTrades += 1;
-          acc.totalStaked += getBackStake(trade);
-          acc.pnl += getRealisedPnl(trade);
-        }
-        return acc;
-      },
-      { totalStaked: 0, totalTrades: 0, pnl: 0 },
-    );
-  }, [trades]);
+    return statsQuery.data?.summary ?? { totalStaked: 0, totalTrades: 0, pnl: 0 };
+  }, [statsQuery.data]);
 
-  // Calculate profit by competition (only for taken trades)
   const competitionProfits = useMemo(() => {
-    const profitMap = new Map<string, { pnl: number; trades: number; staked: number }>();
-    
-    trades.forEach(trade => {
-      // Only count trades that were actually taken (back bet placed/matched)
-      if (!isTakenTrade(trade)) return;
-      
-      const compName = trade.competition_name || trade.competition || 'Unknown';
-      const existing = profitMap.get(compName) || { pnl: 0, trades: 0, staked: 0 };
-      profitMap.set(compName, {
-        pnl: existing.pnl + getRealisedPnl(trade),
-        trades: existing.trades + 1,
-        staked: existing.staked + getBackStake(trade),
-      });
-    });
-    
-    return Array.from(profitMap.entries())
-      .map(([name, data]) => ({ name, ...data }))
-      .sort((a, b) => b.pnl - a.pnl); // Sort by profit descending
-  }, [trades]);
+    return statsQuery.data?.competitions ?? [];
+  }, [statsQuery.data]);
 
   const error = tradesQuery.error;
+
+  const toggleExposureBoxTrades = async (row: ExposureStat) => {
+    const nextKey = `${row.strategy_key}|${row.setting_key}|${row.setting_value}`;
+    if (activeExposureBoxKey === nextKey) {
+      // Clear
+      setActiveExposureBox(null);
+      setActiveExposureBoxLoading(false);
+      if (savedStatusFilter !== null) {
+        setStatusFilter(savedStatusFilter);
+      }
+      setSavedStatusFilter(null);
+      return;
+    }
+
+    // Activate
+    setExpandedTrades(new Set());
+    setActiveExposureBox({ strategy_key: row.strategy_key, setting_key: row.setting_key, setting_value: row.setting_value });
+    setActiveExposureBoxLoading(false);
+
+    // Ensure status doesn't interfere (table-only anyway, but this avoids showing nothing).
+    setSavedStatusFilter(statusFilter);
+    setStatusFilter("");
+  };
 
   return (
     <div className="space-y-6">
@@ -218,12 +300,27 @@ export default function EplUnder25View() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
-          <SummaryBar summary={summary} />
+          <SummaryBar
+            summary={summary}
+            isLoading={statsQuery.isLoading}
+            error={statsQuery.error instanceof Error ? statsQuery.error.message : null}
+          />
+
+          <ExposureStatsSection
+            isLoading={exposureStatsQuery.isLoading}
+            error={exposureStatsQuery.error instanceof Error ? exposureStatsQuery.error.message : null}
+            stats={exposureStatsQuery.data ?? []}
+            activeExposureBoxKey={activeExposureBoxKey}
+            onToggleExposureBoxTrades={toggleExposureBoxTrades}
+            toggling={activeExposureBoxLoading}
+          />
 
           {/* Profit by Competition */}
-          {competitionProfits.length > 0 && (
-            <CompetitionProfitSummary competitions={competitionProfits} />
-          )}
+          <CompetitionProfitSummary
+            competitions={competitionProfits}
+            isLoading={statsQuery.isLoading}
+            error={statsQuery.error instanceof Error ? statsQuery.error.message : null}
+          />
 
           <Filters
             status={statusFilter}
@@ -238,6 +335,8 @@ export default function EplUnder25View() {
             onRefresh={() => {
               queryClient.invalidateQueries({ queryKey: ["strategy-trades", "epl-under25"] });
               queryClient.invalidateQueries({ queryKey: ["strategy-trades", "epl-under25", "competition-names"] });
+              queryClient.invalidateQueries({ queryKey: ["strategy-trades", "epl-under25", "stats"] });
+              queryClient.invalidateQueries({ queryKey: ["strategy-trades", "epl-under25", "exposure-stats"] });
             }}
             disabled={tradesQuery.isFetching}
           />
@@ -250,6 +349,9 @@ export default function EplUnder25View() {
             cancelling={cancelTradesMutation.isPending}
             expandedTrades={expandedTrades}
             onToggleExpand={toggleExpanded}
+            onLoadMore={() => tradesQuery.fetchNextPage()}
+            hasMore={!!tradesQuery.hasNextPage}
+            loadingMore={tradesQuery.isFetchingNextPage}
           />
         </CardContent>
       </Card>
@@ -259,14 +361,26 @@ export default function EplUnder25View() {
 
 function SummaryBar({
   summary,
+  isLoading,
+  error,
 }: {
   summary: { totalStaked: number; totalTrades: number; pnl: number };
+  isLoading: boolean;
+  error: string | null;
 }) {
+  const isError = !!error;
+  const pnlValue = isLoading ? "Loading..." : isError ? "—" : formatCurrency(summary.pnl);
+  const stakedValue = isLoading ? "Loading..." : isError ? "—" : formatCurrency(summary.totalStaked);
+  const tradesValue = isLoading ? "Loading..." : isError ? "—" : summary.totalTrades;
   return (
     <div className="grid gap-3 sm:grid-cols-3">
-      <SummaryCard label="Overall P&L" value={formatCurrency(summary.pnl)} intent={summary.pnl >= 0 ? "positive" : "negative"} />
-      <SummaryCard label="Total Back Staked" value={formatCurrency(summary.totalStaked)} />
-      <SummaryCard label="Number of Trades" value={summary.totalTrades} />
+      <SummaryCard
+        label="Overall P&L"
+        value={pnlValue}
+        intent={!isLoading && !isError && summary.pnl < 0 ? "negative" : "positive"}
+      />
+      <SummaryCard label="Total Back Staked" value={stakedValue} />
+      <SummaryCard label="Number of Trades" value={tradesValue} />
     </div>
   );
 }
@@ -292,11 +406,151 @@ function SummaryCard({
   );
 }
 
+function ExposureStatsSection({
+  isLoading,
+  error,
+  stats,
+  activeExposureBoxKey,
+  onToggleExposureBoxTrades,
+  toggling,
+}: {
+  isLoading: boolean;
+  error: string | null;
+  stats: ExposureStat[];
+  activeExposureBoxKey: string;
+  onToggleExposureBoxTrades: (row: ExposureStat) => void;
+  toggling: boolean;
+}) {
+  if (isLoading) {
+    return (
+      <div className="grid gap-3 sm:grid-cols-2">
+        <div className="rounded-xl border border-[var(--color-divider)] bg-[var(--color-card)]/70 p-4">
+          <div className="text-xs text-[var(--color-text-muted)]">Exposure (in-play)</div>
+          <div className="text-sm text-[var(--color-text-muted)] mt-1">Loading...</div>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="rounded-xl border border-[rgba(248,113,113,0.35)] bg-[var(--color-card)]/60 p-4">
+        <div className="text-xs text-[var(--color-text-muted)]">Exposure (in-play)</div>
+        <div className="text-sm text-[var(--color-negative)] mt-1">Failed to load exposure stats</div>
+      </div>
+    );
+  }
+
+  if (!stats.length) {
+    return (
+      <div className="rounded-xl border border-[var(--color-divider)] bg-[var(--color-card)]/60 p-4">
+        <div className="text-xs text-[var(--color-text-muted)]">Exposure (in-play)</div>
+        <div className="text-sm text-[var(--color-text-muted)] mt-1">No settled exposure data found.</div>
+      </div>
+    );
+  }
+
+  const byStrategy = new Map<string, ExposureStat[]>();
+  stats.forEach((row) => {
+    const arr = byStrategy.get(row.strategy_key) || [];
+    arr.push(row);
+    byStrategy.set(row.strategy_key, arr);
+  });
+
+  const orderedKeys = Array.from(byStrategy.keys()).sort((a, b) => a.localeCompare(b));
+
+  return (
+    <div className="space-y-2">
+      <div className="text-xs font-medium text-[var(--color-text-muted)] uppercase tracking-wider">
+        Exposure (in-play)
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        {orderedKeys.flatMap((strategyKey) => {
+          const rows = (byStrategy.get(strategyKey) || []).slice().sort((a, b) => a.setting_value - b.setting_value);
+          return rows.map((row) => {
+            const title = STRATEGY_NAMES[strategyKey] || strategyKey;
+            const settingLabel =
+              row.setting_key === 'lay_ticks_below_back'
+                ? `${row.setting_value} ticks below`
+                : `${row.setting_value}% profit target`;
+            const avg = formatDurationSeconds(row.average_exposure_seconds);
+            const subtitle = `${row.total_trades} counted • ${row.losing_trades_excluded} losers excluded`;
+            const pnlIntent = row.net_pnl >= 0 ? "positive" : "negative";
+            const boxKey = `${row.strategy_key}|${row.setting_key}|${row.setting_value}`;
+            const isActive = activeExposureBoxKey === boxKey;
+
+            return (
+              <div
+                key={`${row.strategy_key}-${row.setting_key}-${row.setting_value}`}
+                className={cn(
+                  "rounded-xl border border-[var(--color-divider)] bg-[var(--color-card)]/70 p-4",
+                  pnlIntent === "positive" && "border-[rgba(16,185,129,0.35)]",
+                  pnlIntent === "negative" && "border-[rgba(239,68,68,0.35)]",
+                )}
+              >
+                <div className="text-xs text-[var(--color-text-muted)]">{title}</div>
+                <div className="text-xs text-[var(--color-text-muted)] mt-1">{settingLabel}</div>
+                <div className="text-xl font-semibold text-[var(--color-text-primary)] mt-2">{avg}</div>
+                <div className="text-xs text-[var(--color-text-muted)] mt-1">{subtitle}</div>
+                <div className={cn(
+                  "text-sm font-semibold mt-2",
+                  pnlIntent === "positive" ? "text-[var(--color-positive)]" : "text-[var(--color-negative)]"
+                )}>
+                  {formatCurrency(row.net_pnl)}
+                </div>
+                <div className="mt-3">
+                  <Button
+                    type="button"
+                    variant={isActive ? "secondary" : "ghost"}
+                    size="sm"
+                    disabled={toggling}
+                    onClick={() => onToggleExposureBoxTrades(row)}
+                  >
+                    {isActive ? "Clear trades filter" : "Show trades"}
+                  </Button>
+                </div>
+              </div>
+            );
+          });
+        })}
+      </div>
+    </div>
+  );
+}
+
+function formatDurationSeconds(totalSeconds: number) {
+  const seconds = Number.isFinite(totalSeconds) ? Math.max(0, Math.floor(totalSeconds)) : 0;
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  if (mins <= 0) return `${secs}s`;
+  return `${mins}m ${secs}s`;
+}
+
 function CompetitionProfitSummary({
   competitions,
+  isLoading,
+  error,
 }: {
   competitions: Array<{ name: string; pnl: number; trades: number; staked: number }>;
+  isLoading: boolean;
+  error: string | null;
 }) {
+  if (isLoading) {
+    return (
+      <div className="space-y-2">
+        <h3 className="text-sm font-medium text-[var(--color-text-muted)]">Profit by Competition</h3>
+        <div className="text-sm text-[var(--color-text-muted)]">Loading...</div>
+      </div>
+    );
+  }
+  if (error) {
+    return (
+      <div className="space-y-2">
+        <h3 className="text-sm font-medium text-[var(--color-text-muted)]">Profit by Competition</h3>
+        <div className="text-sm text-[var(--color-negative)]">Failed to load totals</div>
+      </div>
+    );
+  }
   if (competitions.length === 0) return null;
   
   return (
@@ -425,6 +679,9 @@ function TradesTable({
   cancelling,
   expandedTrades,
   onToggleExpand,
+  onLoadMore,
+  hasMore,
+  loadingMore,
 }: {
   trades: StrategyTrade[];
   isLoading: boolean;
@@ -433,6 +690,9 @@ function TradesTable({
   cancelling: boolean;
   expandedTrades: Set<string>;
   onToggleExpand: (id: string) => void;
+  onLoadMore: () => void;
+  hasMore: boolean;
+  loadingMore: boolean;
 }) {
   if (isLoading) {
     return (
@@ -552,6 +812,20 @@ function TradesTable({
           })}
         </tbody>
       </table>
+      <div className="flex items-center justify-between gap-3 border-t border-[var(--color-divider)] bg-[var(--color-card)]/40 px-4 py-3">
+        <div className="text-xs text-[var(--color-text-muted)]">
+          Status filters the table only. Totals count settled trades.
+        </div>
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          disabled={!hasMore || loadingMore}
+          onClick={onLoadMore}
+        >
+          {loadingMore ? "Loading..." : hasMore ? "Load older trades" : "No more trades"}
+        </Button>
+      </div>
     </div>
   );
 }
@@ -746,18 +1020,6 @@ function getBackStake(trade: StrategyTrade) {
  * A trade is "taken" if we have evidence of a placed/matched back bet.
  * This excludes scheduled placeholders and GoalReactive watching/goal_wait pre-entry rows.
  */
-function isTakenTrade(trade: StrategyTrade) {
-  return getBackStake(trade) > 0 || trade.back_order_ref != null;
-}
-
-function getTotalStake(trade: StrategyTrade) {
-  if (typeof trade.total_stake === "number") {
-    return trade.total_stake;
-  }
-  const layExposure = trade.lay_size ?? trade.lay_matched_size ?? 0;
-  return getBackStake(trade) + layExposure;
-}
-
 function getRealisedPnl(trade: StrategyTrade) {
   return trade.realised_pnl ?? trade.pnl ?? 0;
 }
