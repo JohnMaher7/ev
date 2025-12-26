@@ -18,6 +18,7 @@ const COMPETITION_MATCHERS = [
   /^Italian Serie A$/i,          // Serie A
   /^UEFA Champions League$/i,    // Champions League
   /^UEFA Europa League$/i,  // UEFA Europa League
+  /^Africa Cup of Nations$/i,  // Africa Cup of Nations
   /^English Football League Cup$/i,  // English Football League Cup
 ];
 
@@ -29,6 +30,7 @@ const COMPETITION_IDS = [
   '81',        // Italian Serie A
   '228',       //UEFA Champions League
   '2005',      // UEFA Europa League
+  '12209528',  // Africa Cup of Nations
   '2134',      // English Football League Cup
 ];
 
@@ -232,6 +234,11 @@ function getMiddlePrice(backPrice, layPrice) {
  * Create safe API wrapper functions for a strategy instance
  */
 function createSafeApiWrappers(betfair, logger) {
+  function isInvalidSessionError(err) {
+    const msg = err && err.message ? err.message : String(err);
+    return /INVALID_SESSION_INFORMATION|ANGX-0003/i.test(msg);
+  }
+
   async function requireSessionWithRetry(label) {
     try {
       return await betfair.requireSession(label);
@@ -247,6 +254,12 @@ function createSafeApiWrappers(betfair, logger) {
     } catch (err) {
       logger.warn(`[shared] RPC retry needed for ${label} (${method}): ${err.message}`);
       try {
+        if (isInvalidSessionError(err) && typeof betfair.invalidateSession === 'function') {
+          logger.warn(`[shared] Invalid session detected for ${label}; re-authenticating...`);
+          betfair.invalidateSession();
+          const newToken = await requireSessionWithRetry(`reauth-${label}`);
+          return await betfair.rpc(newToken, method, params);
+        }
         return await betfair.rpc(sessionToken, method, params);
       } catch (err2) {
         logger.error(`[shared] Emergency Exit: ${label} ${err2.message}`);
@@ -374,14 +387,44 @@ function createSafeApiWrappers(betfair, logger) {
     return { matched: false, sizeMatched, cancelled: true, lapsed: false, details };
   }
 
-  async function cancelOrderSafe(betId, sessionToken, label) {
-    if (!betId) return;
+  /**
+   * Cancel an order on Betfair.
+   * @param {string} betId - The bet ID to cancel
+   * @param {string} marketId - The market ID (REQUIRED by Betfair API)
+   * @param {string} sessionToken - Session token
+   * @param {string} label - Label for logging
+   * @returns {Promise<{status: string, errorCode?: string, sizeMatched?: number, sizeCancelled?: number}>}
+   */
+  async function cancelOrderSafe(betId, marketId, sessionToken, label) {
+    if (!betId) {
+      return { status: 'FAILED', errorCode: 'NO_BET_ID' };
+    }
+    if (!marketId) {
+      logger.error(`[shared] cancelOrderSafe: marketId is required for bet ${betId}`);
+      return { status: 'FAILED', errorCode: 'NO_MARKET_ID' };
+    }
     try {
-      await rpcWithRetry(sessionToken, 'SportsAPING/v1.0/cancelOrders', {
+      const res = await rpcWithRetry(sessionToken, 'SportsAPING/v1.0/cancelOrders', {
+        marketId,
         instructions: [{ betId }],
       }, label);
-    } catch {
-      // Logged in rpcWithRetry
+      
+      const report = res?.instructionReports?.[0];
+      if (report && report.status === 'SUCCESS') {
+        return { 
+          status: 'SUCCESS', 
+          sizeMatched: report.instruction?.sizeReduction || 0,
+          sizeCancelled: report.sizeCancelled || 0,
+        };
+      }
+      
+      // API returned failure
+      const errorCode = report?.errorCode || res?.errorCode || 'UNKNOWN';
+      logger.warn(`[shared] cancelOrderSafe failed for bet ${betId}: ${errorCode}`);
+      return { status: 'FAILED', errorCode };
+    } catch (err) {
+      logger.error(`[shared] cancelOrderSafe exception for bet ${betId}: ${err.message}`);
+      return { status: 'FAILED', errorCode: 'EXCEPTION' };
     }
   }
 

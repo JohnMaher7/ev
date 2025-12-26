@@ -28,7 +28,7 @@ export function formatDateTime(date: string | Date): string {
   const d = new Date(date);
   return new Intl.DateTimeFormat('en-GB', {
     dateStyle: 'short',
-    timeStyle: 'short',
+    timeStyle: 'medium',  // Changed from 'short' to include seconds (HH:mm:ss)
     timeZone: 'Europe/London',
   }).format(d);
 }
@@ -36,7 +36,7 @@ export function formatDateTime(date: string | Date): string {
 export function formatTime(date: string | Date): string {
   const d = new Date(date);
   return new Intl.DateTimeFormat('en-GB', {
-    timeStyle: 'short',
+    timeStyle: 'medium',  // Changed from 'short' to include seconds (HH:mm:ss)
     timeZone: 'Europe/London',
   }).format(d);
 }

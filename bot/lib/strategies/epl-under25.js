@@ -25,7 +25,7 @@ function getDefaultSettings() {
     fixture_lookahead_days: 2,
     commission_rate: 0.0175,
     // Strategy-specific settings (stored in extra JSONB)
-    min_back_price: 1.7,
+    min_back_price: 1.5,
     min_profit_pct: 10,
     back_lead_minutes: 45,
     lay_ticks_below_back: 3,
@@ -36,6 +36,9 @@ function getDefaultSettings() {
     // These settings make the wait + drift percentage configurable.
     stop_loss_wait_seconds: 180,
     stop_loss_pct: 20,
+
+    // Market liquidity threshold - skip trades if total matched volume is below this
+    min_market_liquidity: 1000,
   };
 }
 
@@ -337,12 +340,24 @@ class EplUnder25Strategy {
   }
 
   async rpcWithRetry(sessionToken, method, params, label) {
+    const isInvalidSessionError = (err) => {
+      const msg = err && err.message ? err.message : String(err);
+      return /INVALID_SESSION_INFORMATION|ANGX-0003/i.test(msg);
+    };
+
     try {
       return await this.betfair.rpc(sessionToken, method, params);
     } catch (err) {
       this.logger.warn(`[strategy:epl_under25] RPC retry needed for ${label} (${method}): ${err.message}`);
       try {
-        // Refresh session on retry if needed, or just retry call
+        if (isInvalidSessionError(err) && typeof this.betfair.invalidateSession === 'function') {
+          this.logger.warn(`[strategy:epl_under25] Invalid session detected for ${label}; re-authenticating...`);
+          this.betfair.invalidateSession();
+          const newToken = await this.requireSessionWithRetry(`reauth-${label}`);
+          return await this.betfair.rpc(newToken, method, params);
+        }
+
+        // Fallback: retry call once with the same token (transient failure)
         return await this.betfair.rpc(sessionToken, method, params);
       } catch (err2) {
         this.logger.error(`[strategy:epl_under25] Emergency Exit: ${label} ${err2.message}`);
@@ -526,15 +541,168 @@ class EplUnder25Strategy {
     }
   }
 
-  async cancelOrderSafe(betId, sessionToken, label) {
-    if (!betId) return;
+  /**
+   * Cancel an order on Betfair.
+   * @param {string} betId - The bet ID to cancel
+   * @param {string} marketId - The market ID (REQUIRED by Betfair API)
+   * @param {string} sessionToken - Session token
+   * @param {string} label - Label for logging
+   * @returns {Promise<{status: string, errorCode?: string, sizeCancelled?: number}>}
+   */
+  async cancelOrderSafe(betId, marketId, sessionToken, label) {
+    if (!betId) {
+      return { status: 'FAILED', errorCode: 'NO_BET_ID' };
+    }
+    if (!marketId) {
+      this.logger.error(`[strategy:epl_under25] cancelOrderSafe: marketId is required for bet ${betId}`);
+      return { status: 'FAILED', errorCode: 'NO_MARKET_ID' };
+    }
     try {
-      await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/cancelOrders', {
+      const res = await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/cancelOrders', {
+        marketId,
         instructions: [{ betId }],
       }, label);
+      
+      const report = res?.instructionReports?.[0];
+      if (report && report.status === 'SUCCESS') {
+        return { 
+          status: 'SUCCESS', 
+          sizeCancelled: report.sizeCancelled || 0,
+        };
+      }
+      
+      // API returned failure
+      const errorCode = report?.errorCode || res?.errorCode || 'UNKNOWN';
+      this.logger.warn(`[strategy:epl_under25] cancelOrderSafe failed for bet ${betId}: ${errorCode}`);
+      return { status: 'FAILED', errorCode };
     } catch (err) {
-      // Logged in rpcWithRetry
+      this.logger.error(`[strategy:epl_under25] cancelOrderSafe exception for bet ${betId}: ${err.message}`);
+      return { status: 'FAILED', errorCode: 'EXCEPTION' };
     }
+  }
+
+  /**
+   * Cancel an order and CONFIRM it is no longer executable (prevents double-exposure).
+   * Polls listCurrentOrders until the order is closed or timeout.
+   *
+   * @param {string} betId - The bet ID to cancel
+   * @param {string} marketId - The market ID (REQUIRED by Betfair API)
+   * @param {string} sessionToken - Session token
+   * @param {string} label - Label for logging
+   * @param {Object} opts - Options: confirmMs, pollMs, maxCancelAttempts, notFoundThreshold
+   * @returns {Promise<{closed: boolean, attempts: number, elapsed_ms: number, last_details: any, reason: string, errorCode?: string}>}
+   */
+  async cancelOrderAndConfirm(betId, marketId, sessionToken, label, opts = {}) {
+    const confirmMs = typeof opts.confirmMs === 'number' ? opts.confirmMs : 10000;
+    const pollMs = typeof opts.pollMs === 'number' ? opts.pollMs : 500;
+    const maxCancelAttempts = typeof opts.maxCancelAttempts === 'number' ? opts.maxCancelAttempts : 3;
+    const notFoundThreshold = typeof opts.notFoundThreshold === 'number' ? opts.notFoundThreshold : 3;
+
+    if (!betId) {
+      return { closed: true, attempts: 0, elapsed_ms: 0, last_details: null, reason: 'NO_BET_ID' };
+    }
+    
+    if (!marketId) {
+      this.logger.error(`[strategy:epl_under25] cancelOrderAndConfirm: marketId is required for bet ${betId}`);
+      return { closed: false, attempts: 0, elapsed_ms: 0, last_details: null, reason: 'NO_MARKET_ID', errorCode: 'NO_MARKET_ID' };
+    }
+
+    const start = Date.now();
+    const deadline = start + confirmMs;
+    let attempts = 0;
+    let consecutiveNotFound = 0;
+    let lastDetails = null;
+
+    while (Date.now() < deadline && attempts < maxCancelAttempts) {
+      attempts += 1;
+      
+      // Call cancelOrderSafe and check for IMMEDIATE API failure
+      const cancelRes = await this.cancelOrderSafe(betId, marketId, sessionToken, `${label}-cancel-${attempts}`);
+      
+      if (cancelRes && cancelRes.status === 'FAILED') {
+        // Betfair API rejected the cancel request immediately
+        this.logger.error(`[strategy:epl_under25] Cancel API FAILED for bet ${betId}: ${cancelRes.errorCode}`);
+        
+        // Check if the order might already be closed (e.g., BET_TAKEN_OR_LAPSED)
+        const checkDetails = await this.getOrderDetailsSafe(betId, sessionToken, `${label}-post-fail-check`);
+        if (!checkDetails || checkDetails.status !== 'EXECUTABLE' || (checkDetails.sizeRemaining || 0) === 0) {
+          // Order is already closed - treat as success
+          return {
+            closed: true,
+            attempts,
+            elapsed_ms: Date.now() - start,
+            last_details: checkDetails,
+            reason: 'ALREADY_CLOSED_AFTER_FAIL',
+          };
+        }
+        
+        // If this is a permanent error (not transient), don't keep retrying
+        const permanentErrors = ['BET_ACTION_ERROR', 'INVALID_BET_ID', 'NO_MARKET_ID'];
+        if (permanentErrors.includes(cancelRes.errorCode)) {
+          return {
+            closed: false,
+            attempts,
+            elapsed_ms: Date.now() - start,
+            last_details: checkDetails,
+            reason: 'PERMANENT_API_ERROR',
+            errorCode: cancelRes.errorCode,
+          };
+        }
+        
+        // Transient error - continue to next attempt after a short wait
+        await new Promise((r) => setTimeout(r, pollMs));
+        continue;
+      }
+
+      // Poll until closed or until we decide to re-issue cancel
+      while (Date.now() < deadline) {
+        const details = await this.getOrderDetailsSafe(betId, sessionToken, `${label}-check-${attempts}`);
+
+        if (!details) {
+          consecutiveNotFound += 1;
+          if (consecutiveNotFound >= notFoundThreshold) {
+            return {
+              closed: true,
+              attempts,
+              elapsed_ms: Date.now() - start,
+              last_details: lastDetails,
+              reason: 'NOT_FOUND_CONSECUTIVE',
+            };
+          }
+        } else {
+          consecutiveNotFound = 0;
+          lastDetails = details;
+
+          // "Closed" = no remaining size OR not executable (EXECUTION_COMPLETE / CANCELLED / etc.)
+          if ((details.sizeRemaining || 0) === 0 || details.status !== 'EXECUTABLE') {
+            return {
+              closed: true,
+              attempts,
+              elapsed_ms: Date.now() - start,
+              last_details: details,
+              reason: 'CLOSED_OR_NOT_EXECUTABLE',
+            };
+          }
+        }
+
+        await new Promise((r) => setTimeout(r, pollMs));
+
+        // If still EXECUTABLE with remaining after some polling, break to re-issue cancel
+        if (lastDetails && lastDetails.status === 'EXECUTABLE' && (lastDetails.sizeRemaining || 0) > 0) {
+          // Re-issue cancel after ~2s of polling
+          const polledMs = Date.now() - start;
+          if (polledMs >= attempts * 2000) break;
+        }
+      }
+    }
+
+    return {
+      closed: false,
+      attempts,
+      elapsed_ms: Date.now() - start,
+      last_details: lastDetails,
+      reason: 'NOT_CONFIRMED_BEFORE_DEADLINE',
+    };
   }
 
   async placeLimitLaySafe(marketId, selectionId, size, price, sessionToken, label, persistenceType = 'LAPSE') {
@@ -649,6 +817,7 @@ class EplUnder25Strategy {
           lay_persistence: this.defaults.lay_persistence,
           stop_loss_wait_seconds: this.defaults.stop_loss_wait_seconds,
           stop_loss_pct: this.defaults.stop_loss_pct,
+          min_market_liquidity: this.defaults.min_market_liquidity,
         },
       };
       const { data: created, error: insertErr } = await this.supabase
@@ -711,6 +880,7 @@ class EplUnder25Strategy {
         'lay_persistence',
         'stop_loss_wait_seconds',
         'stop_loss_pct',
+        'min_market_liquidity',
       ];
       for (const k of extraKeys) {
         // Match goal-react behavior: if missing or different, sync to defaults.
@@ -833,6 +1003,7 @@ class EplUnder25Strategy {
             else if (id === '81') competitionIdToName.set(id, 'Italian Serie A');
             else if (id === '228') competitionIdToName.set(id, 'UEFA Champions League');
             else if (id === '2005') competitionIdToName.set(id, 'UEFA Europa League');
+            else if (id === '12209528') competitionIdToName.set(id, 'Africa Cup of Nations');
             else if (id === '2134') competitionIdToName.set(id, 'English Football League Cup');
           }
         });
@@ -934,8 +1105,6 @@ class EplUnder25Strategy {
       }
 
       if (fixtures.length === 0) {
-        await this.pruneFixtures(validEventIds);
-        await this.pruneStaleTrades(validEventIds);
         return;
       }
 
@@ -943,9 +1112,6 @@ class EplUnder25Strategy {
         .from('strategy_fixtures')
         .upsert(fixtures, { onConflict: 'strategy_key,betfair_event_id' });
       if (upsertErr) throw upsertErr;
-
-      await this.pruneFixtures(validEventIds);
-      await this.pruneStaleTrades(validEventIds);
 
       // Drop fixtures that have already kicked off
       const { error: pruneErr } = await this.supabase
@@ -957,7 +1123,12 @@ class EplUnder25Strategy {
 
       // Ensure trade records exist for all fixtures (creates or reactivates)
       for (const fixture of fixtures) {
-        await this.ensureTradeRecord(fixture);
+        try {
+          await this.ensureTradeRecord(fixture);
+        } catch (err) {
+          this.logger.error(`[strategy:epl_under25] Failed to ensure trade record for ${fixture.betfair_event_id}: ${err.message}`);
+          // Continue processing other fixtures even if one fails
+        }
       }
     } catch (err) {
       this.logger.error(`[strategy:epl_under25] Fixtures sync error: ${err.message}`);
@@ -971,6 +1142,10 @@ class EplUnder25Strategy {
   }
 
   async ensureTradeRecord(fixture) {
+    // Define variables at the top to avoid ReferenceError
+    const competitionName = fixture.competition || 'Unknown';
+    const eventName = formatFixtureName(fixture.home, fixture.away, fixture.event_id || fixture.betfair_event_id);
+    
     const { data: existing, error } = await this.supabase
       .from('strategy_trades')
       .select('id, status')
@@ -1014,9 +1189,6 @@ class EplUnder25Strategy {
       }
       return existing.id;
     }
-
-    const competitionName = fixture.competition || 'Unknown';
-    const eventName = formatFixtureName(fixture.home, fixture.away, fixture.event_id || fixture.betfair_event_id);
 
     // Create new trade record
     const insert = {
@@ -1402,8 +1574,8 @@ class EplUnder25Strategy {
           // SPIKE DETECTED - 30% price movement indicates possible goal
           this.logger.log(`[strategy:epl_under25] 🎯 Goal Detected (Price: ${currentBackPrice.toFixed(2)} > ${(state.last_stable_price * 1.30).toFixed(2)}) - Cancelling profit order`);
           
-          // Cancel the profit lay order
-          await this.cancelOrderSafe(state.profit_order_id, sessionToken, 'phase2-cancel-goal');
+          // Cancel the profit lay order (with marketId for Betfair API)
+          await this.cancelOrderSafe(state.profit_order_id, market.marketId, sessionToken, 'phase2-cancel-goal');
           
           // CRITICAL FIX: Verify cancellation and check if lay was matched before/during cancel
           const orderDetails = await this.getOrderDetailsSafe(state.profit_order_id, sessionToken, 'phase2-verify-after-goal');
@@ -1866,6 +2038,26 @@ class EplUnder25Strategy {
     const book = await this.getMarketBookSafe(market.marketId, sessionToken, 'placeBack-book');
     const runner = book?.runners?.find(r => r.selectionId == market.selectionId);
     
+    // Check market liquidity if available (Betfair API may expose totalMatched)
+    const minLiquidity = this.settings.min_market_liquidity || this.defaults.min_market_liquidity;
+    if (book && typeof book.totalMatched === 'number') {
+      if (book.totalMatched < minLiquidity) {
+        this.logger.log(`[strategy:epl_under25] Market liquidity too low (${book.totalMatched} < ${minLiquidity}) for ${trade.fixture_name} - cancelling trade`);
+        await this.updateTrade(trade.id, {
+          status: 'cancelled',
+          last_error: `MARKET_LIQUIDITY_TOO_LOW: ${book.totalMatched} < ${minLiquidity}`,
+        });
+        await this.logEvent(trade.id, 'TRADE_CANCELLED', {
+          reason: 'MARKET_LIQUIDITY_TOO_LOW',
+          total_matched: book.totalMatched,
+          min_liquidity: minLiquidity,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+    }
+    // If totalMatched is not available, skip the check (graceful fallback)
+    
     // Get BOTH back and lay prices for logging
     const bestBackPrice = runner?.ex?.availableToBack?.[0]?.price;
     const bestLayPrice = runner?.ex?.availableToLay?.[0]?.price;
@@ -2075,16 +2267,246 @@ class EplUnder25Strategy {
         if (isPreMatch) {
             const matchedAmount = order.sizeMatched || 0;
             const unmatchedAmount = order.sizeRemaining || 0;
+            const minsToKickoff = (kickoff.getTime() - now.getTime()) / 60000;
+            const stateData = trade.state_data || {};
             
+            // NEW RULE: If ANY portion is unmatched 10 minutes before kickoff, cancel unmatched and retry at current lay price
+            if (unmatchedAmount > 0 && minsToKickoff <= 10 && minsToKickoff > 0) {
+                // Check if we've already retried (prevent multiple retries)
+                if (stateData.retry_attempted) {
+                    this.logger.log(`[strategy:epl_under25] Pre-match: £${unmatchedAmount} still unmatched, but retry already attempted - waiting for kickoff`);
+                    return;
+                }
+                
+                this.logger.log(`[strategy:epl_under25] ⚠️ Back order has unmatched portion (£${unmatchedAmount} of £${trade.back_size}) at ${minsToKickoff.toFixed(1)} mins before kickoff - cancelling and retrying`);
+                
+                // Store original order reference for audit trail
+                const originalBackOrderRef = trade.back_order_ref;
+                const originalMatchedAmount = matchedAmount;
+                const originalMatchedPrice = order.averagePriceMatched || order.price;
+                
+                try {
+                    // Fetch market first (needed for cancel API)
+                    const market = await this.ensureMarket(trade, sessionToken);
+                    if (!market) {
+                        this.logger.error(`[strategy:epl_under25] Failed to get market for retry - cannot cancel`);
+                        await this.updateTrade(trade.id, {
+                            last_error: 'RETRY_FAILED_NO_MARKET',
+                            state_data: { ...stateData, retry_attempted: true },
+                        });
+                        return;
+                    }
+                    
+                    // Cancel the unmatched portion with CONFIRMATION (prevents placing retry while original still open)
+                    const cancelRes = await this.cancelOrderAndConfirm(originalBackOrderRef, market.marketId, sessionToken, 'checkBackOrder-retry-cancel', {
+                        confirmMs: 10000,  // 10 seconds max
+                        pollMs: 500,
+                        maxCancelAttempts: 5,
+                        notFoundThreshold: 3,
+                    });
+                    
+                    // Get final matched amount after cancellation
+                    let finalMatchedAmount = originalMatchedAmount;
+                    let finalMatchedPrice = originalMatchedPrice;
+                    if (cancelRes.last_details) {
+                        finalMatchedAmount = cancelRes.last_details.sizeMatched || originalMatchedAmount;
+                        finalMatchedPrice = cancelRes.last_details.averagePriceMatched || originalMatchedPrice;
+                    }
+                    
+                    if (!cancelRes.closed) {
+                        // Cancel not confirmed - don't place retry to avoid double exposure
+                        this.logger.error(`[strategy:epl_under25] ❌ Cancel NOT CONFIRMED for bet ${originalBackOrderRef} - NOT placing retry`);
+                        await this.updateTrade(trade.id, {
+                            last_error: 'CANCEL_NOT_CONFIRMED_FOR_RETRY',
+                            state_data: { ...stateData, retry_attempted: true, cancel_failed: true },
+                        });
+                        await this.logEvent(trade.id, 'BACK_CANCEL_NOT_CONFIRMED', {
+                            betId: originalBackOrderRef,
+                            attempts: cancelRes.attempts,
+                            elapsed_ms: cancelRes.elapsed_ms,
+                            matched_before_cancel: originalMatchedAmount,
+                            reason: cancelRes.reason,
+                            timestamp: new Date().toISOString(),
+                        });
+                        return;
+                    }
+                    
+                    this.logger.log(`[strategy:epl_under25] ✓ Cancel confirmed for ${originalBackOrderRef} - final matched: £${finalMatchedAmount}`);
+                    
+                    // Calculate amount to retry (only the unmatched portion)
+                    const amountToRetry = (trade.target_stake || this.settings.default_stake) - finalMatchedAmount;
+                    
+                    if (amountToRetry <= 0) {
+                        // Everything matched during cancel confirmation - proceed with green-up
+                        this.logger.log(`[strategy:epl_under25] Full stake matched during cancel confirmation - proceeding with lay`);
+                        trade.back_matched_size = finalMatchedAmount;
+                        trade.back_price = finalMatchedPrice;
+                        await this.updateTrade(trade.id, {
+                            back_matched_size: finalMatchedAmount,
+                            back_price: finalMatchedPrice,
+                            state_data: { ...stateData, retry_attempted: true },
+                        });
+                        await this.placeLayForGreenUp(trade, sessionToken, finalMatchedAmount, finalMatchedPrice);
+                        return;
+                    }
+                    
+                    // Get current market prices for retry
+                    const retryBook = await this.getMarketBookSafe(market.marketId, sessionToken, 'checkBackOrder-retry-book');
+                    const retryRunner = retryBook?.runners?.find(r => r.selectionId == market.selectionId);
+                    const currentLayPrice = retryRunner?.ex?.availableToLay?.[0]?.price;
+                    
+                    if (!currentLayPrice) {
+                        this.logger.error(`[strategy:epl_under25] No lay price for retry - keeping matched portion (£${finalMatchedAmount})`);
+                        
+                        // If we have some matched amount, proceed with that
+                        if (finalMatchedAmount > 0) {
+                            this.logger.log(`[strategy:epl_under25] Proceeding with partially matched amount: £${finalMatchedAmount}`);
+                            trade.back_matched_size = finalMatchedAmount;
+                            trade.back_price = finalMatchedPrice;
+                            await this.updateTrade(trade.id, {
+                                back_matched_size: finalMatchedAmount,
+                                back_price: finalMatchedPrice,
+                                back_stake: finalMatchedAmount,
+                                state_data: { ...stateData, retry_attempted: true },
+                            });
+                            await this.placeLayForGreenUp(trade, sessionToken, finalMatchedAmount, finalMatchedPrice);
+                        } else {
+                            await this.updateTrade(trade.id, {
+                                status: 'cancelled',
+                                last_error: 'RETRY_FAILED_NO_LAY_PRICE',
+                                state_data: { ...stateData, retry_attempted: true },
+                            });
+                            await this.logEvent(trade.id, 'RETRY_FAILED', {
+                                reason: 'NO_LAY_PRICE',
+                                original_bet_id: originalBackOrderRef,
+                                timestamp: new Date().toISOString(),
+                            });
+                        }
+                        return;
+                    }
+                    
+                    // Place retry order for ONLY the unmatched amount
+                    this.logger.log(`[strategy:epl_under25] Placing retry for unmatched £${amountToRetry.toFixed(2)} @ current lay price ${currentLayPrice}`);
+                    
+                    const customerRef = `BACK-RETRY-${Date.now()}`;
+                    const placeRes = await this.rpcWithRetry(sessionToken, 'SportsAPING/v1.0/placeOrders', {
+                        marketId: market.marketId,
+                        customerRef,
+                        instructions: [
+                            {
+                                selectionId: market.selectionId,
+                                side: 'BACK',
+                                orderType: 'LIMIT',
+                                limitOrder: {
+                                    size: amountToRetry,
+                                    price: currentLayPrice,
+                                    persistenceType: 'LAPSE',
+                                },
+                            },
+                        ],
+                    }, 'checkBackOrder-retry-place');
+                    
+                    const report = placeRes?.instructionReports?.[0];
+                    if (report && report.status === 'SUCCESS') {
+                        this.logger.log(`[strategy:epl_under25] ✓ Retry back placed: £${amountToRetry} @ ${currentLayPrice} (betId: ${report.betId})`);
+                        
+                        // Calculate combined weighted average price if we have original matched portion
+                        let combinedMatchedSize = finalMatchedAmount;
+                        let combinedMatchedPrice = finalMatchedPrice;
+                        
+                        // Store retry bet info - will combine with original matched on next check
+                        await this.updateTrade(trade.id, {
+                            back_order_ref: report.betId,
+                            back_matched_size: finalMatchedAmount,  // Already matched from original
+                            back_price: finalMatchedPrice,
+                            state_data: { 
+                                ...stateData, 
+                                retry_attempted: true, 
+                                original_back_order_ref: originalBackOrderRef,
+                                original_matched_amount: finalMatchedAmount,
+                                original_matched_price: finalMatchedPrice,
+                                retry_bet_id: report.betId,
+                                retry_amount: amountToRetry,
+                                retry_price: currentLayPrice,
+                            },
+                        });
+                        
+                        trade.back_order_ref = report.betId;
+                        
+                        await this.logEvent(trade.id, 'BACK_RETRY_PLACED', {
+                            new_bet_id: report.betId,
+                            original_bet_id: originalBackOrderRef,
+                            original_matched_amount: finalMatchedAmount,
+                            original_matched_price: finalMatchedPrice,
+                            retry_amount: amountToRetry,
+                            retry_price: currentLayPrice,
+                            mins_to_kickoff: minsToKickoff,
+                            timestamp: new Date().toISOString(),
+                        });
+                    } else {
+                        this.logger.error(`[strategy:epl_under25] ❌ Retry back FAILED: ${report?.errorCode}`);
+                        
+                        // If we have original matched amount, proceed with that
+                        if (finalMatchedAmount > 0) {
+                            this.logger.log(`[strategy:epl_under25] Retry failed but have £${finalMatchedAmount} matched - proceeding with partial`);
+                            trade.back_matched_size = finalMatchedAmount;
+                            trade.back_price = finalMatchedPrice;
+                            await this.updateTrade(trade.id, {
+                                back_matched_size: finalMatchedAmount,
+                                back_price: finalMatchedPrice,
+                                back_stake: finalMatchedAmount,
+                                state_data: { ...stateData, retry_attempted: true, retry_failed: true },
+                            });
+                            await this.placeLayForGreenUp(trade, sessionToken, finalMatchedAmount, finalMatchedPrice);
+                        } else {
+                            await this.updateTrade(trade.id, {
+                                status: 'cancelled',
+                                last_error: `RETRY_FAILED: ${report?.errorCode}`,
+                                state_data: { ...stateData, retry_attempted: true },
+                            });
+                            await this.logEvent(trade.id, 'RETRY_FAILED', {
+                                reason: 'PLACE_ORDER_FAILED',
+                                errorCode: report?.errorCode,
+                                original_bet_id: originalBackOrderRef,
+                                timestamp: new Date().toISOString(),
+                            });
+                        }
+                    }
+                } catch (retryErr) {
+                    this.logger.error(`[strategy:epl_under25] Retry exception: ${retryErr.message}`);
+                    
+                    // If we had some matched before the error, note it
+                    if (originalMatchedAmount > 0) {
+                        await this.updateTrade(trade.id, {
+                            back_matched_size: originalMatchedAmount,
+                            back_price: originalMatchedPrice,
+                            back_stake: originalMatchedAmount,
+                            last_error: `RETRY_EXCEPTION: ${retryErr.message}`,
+                            state_data: { ...stateData, retry_attempted: true, retry_exception: true },
+                        });
+                    } else {
+                        await this.updateTrade(trade.id, {
+                            status: 'cancelled',
+                            last_error: `RETRY_EXCEPTION: ${retryErr.message}`,
+                            state_data: { ...stateData, retry_attempted: true },
+                        });
+                    }
+                    await this.logEvent(trade.id, 'RETRY_FAILED', {
+                        reason: 'EXCEPTION',
+                        error: retryErr.message,
+                        original_bet_id: originalBackOrderRef,
+                        original_matched_amount: originalMatchedAmount,
+                        timestamp: new Date().toISOString(),
+                    });
+                }
+                return;
+            }
+            
+            // Log status for trades not yet at 10 minute window
             if (matchedAmount > 0 && unmatchedAmount > 0) {
-                // PARTIAL MATCH - Wait until kickoff, then cancel remainder and green-up
-                // Log progress - will be handled at kickoff
-                const minsToKickoff = (kickoff.getTime() - now.getTime()) / 60000;
-                this.logger.log(`[strategy:epl_under25] Pre-match partial: £${matchedAmount} of £${trade.back_size} matched - waiting for kickoff (${minsToKickoff.toFixed(1)} mins)`);
-                // Will check again on next poll - handled at kickoff in the "now >= kickoff" section below
+                this.logger.log(`[strategy:epl_under25] Pre-match partial: £${matchedAmount} of £${trade.back_size} matched (${minsToKickoff.toFixed(1)} mins to kickoff, retry at 10 mins)`);
             } else if (matchedAmount === 0) {
-                // Nothing matched yet - just wait
-                this.logger.log(`[strategy:epl_under25] Pre-match: back order pending, no matches yet`);
+                this.logger.log(`[strategy:epl_under25] Pre-match: back order pending, no matches yet (${minsToKickoff.toFixed(1)} mins to kickoff)`);
             }
             
             // Still pending - will check again on next poll

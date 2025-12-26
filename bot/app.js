@@ -34,6 +34,7 @@ const {
   keepAlive,
   getSessionToken,
   setSessionToken,
+  invalidateSession,
   betfairRpc,
   getLoginDiagnostics,
 } = require('./lib/betfair-session');
@@ -159,6 +160,7 @@ async function main() {
       betfair: {
         requireSession,
         rpc: betfairRpcWithToken,
+        invalidateSession,
       },
       logger: console,
     };
