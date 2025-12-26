@@ -79,6 +79,10 @@ function getDefaultSettings() {
     // Polling
     in_play_poll_interval_seconds: 15,
     
+    // Post-goal polling boost: increase poll frequency after goal detection for better reactivity
+    post_goal_poll_interval_seconds: 5,   // Poll every 5s during boost window
+    post_goal_poll_boost_seconds: 120,    // Boost lasts 120s after goal detection
+    
     // General
     fixture_lookahead_days: 7,
     commission_rate: 0.0175,
@@ -110,6 +114,7 @@ class EplUnder25GoalReactStrategy {
     // Scheduler state
     this.smartSchedulerTimer = null;
     this.activePollingTimer = null;
+    this.currentPollIntervalMs = null;  // Track current interval to avoid redundant timer restarts
     this.syncingFixtures = false;
     this.processingActive = false;
 
@@ -408,18 +413,58 @@ class EplUnder25GoalReactStrategy {
     }
   }
 
-  startActivePolling() {
-    if (this.activePollingTimer) return;
+  /**
+   * Start active polling with optional custom interval
+   * @param {number|null} intervalMs - Optional custom interval in milliseconds (defaults to base poll interval)
+   * @param {boolean} runImmediately - Whether to run processInPlayGames immediately (default true on initial start)
+   */
+  startActivePolling(intervalMs = null, runImmediately = true) {
+    const basePollInterval = (this.settings?.in_play_poll_interval_seconds || this.defaults.in_play_poll_interval_seconds) * 1000;
+    const pollInterval = intervalMs || basePollInterval;
     
-    const pollInterval = (this.settings?.in_play_poll_interval_seconds || this.defaults.in_play_poll_interval_seconds) * 1000;
+    // If timer already running at the same interval, do nothing
+    if (this.activePollingTimer && this.currentPollIntervalMs === pollInterval) {
+      return;
+    }
+    
+    // Stop existing timer if running (will restart with new interval)
+    if (this.activePollingTimer) {
+      clearInterval(this.activePollingTimer);
+      this.activePollingTimer = null;
+    }
+    
+    this.currentPollIntervalMs = pollInterval;
     this.logger.log(`[strategy:${STRATEGY_KEY}] ▶ STARTING active ${pollInterval / 1000}s polling`);
     
     this.activePollingTimer = setInterval(() => {
       this.processInPlayGames('poll').catch(this.logError('processInPlayGames'));
     }, pollInterval);
     
-    // Run immediately
-    this.processInPlayGames('immediate').catch(this.logError('processInPlayGames'));
+    // Run immediately on initial start
+    if (runImmediately) {
+      this.processInPlayGames('immediate').catch(this.logError('processInPlayGames'));
+    }
+  }
+
+  /**
+   * Update poll interval dynamically (restarts timer only if interval changed)
+   * @param {number} intervalMs - New interval in milliseconds
+   */
+  updatePollInterval(intervalMs) {
+    if (!this.activePollingTimer) {
+      // No active polling - start with the new interval
+      this.startActivePolling(intervalMs, false);
+      return;
+    }
+    
+    if (this.currentPollIntervalMs === intervalMs) {
+      // Already at this interval - no change needed
+      return;
+    }
+    
+    // Restart with new interval (don't run immediately - we just polled)
+    this.logger.log(`[strategy:${STRATEGY_KEY}] 🔄 Changing poll interval: ${this.currentPollIntervalMs / 1000}s → ${intervalMs / 1000}s`);
+    this.startActivePolling(intervalMs, false);
   }
 
   stopActivePolling() {
@@ -427,6 +472,7 @@ class EplUnder25GoalReactStrategy {
       this.logger.log(`[strategy:${STRATEGY_KEY}] ⏸ STOPPING active polling`);
       clearInterval(this.activePollingTimer);
       this.activePollingTimer = null;
+      this.currentPollIntervalMs = null;
     }
   }
 
@@ -457,6 +503,8 @@ class EplUnder25GoalReactStrategy {
           profit_target_pct: this.defaults.profit_target_pct,
           stop_loss_pct: this.defaults.stop_loss_pct,
           in_play_poll_interval_seconds: this.defaults.in_play_poll_interval_seconds,
+          post_goal_poll_interval_seconds: this.defaults.post_goal_poll_interval_seconds,
+          post_goal_poll_boost_seconds: this.defaults.post_goal_poll_boost_seconds,
           min_market_liquidity: this.defaults.min_market_liquidity,
         },
       };
@@ -501,6 +549,8 @@ class EplUnder25GoalReactStrategy {
         'profit_target_pct',
         'stop_loss_pct',
         'in_play_poll_interval_seconds',
+        'post_goal_poll_interval_seconds',
+        'post_goal_poll_boost_seconds',
         'min_market_liquidity',
       ];
 
@@ -788,6 +838,40 @@ class EplUnder25GoalReactStrategy {
       }
 
       this.logger.log(`[strategy:${STRATEGY_KEY}] <<< Processed ${activeCount} active trades (${pendingCount} pending kickoff)`);
+
+      // --- Adaptive Polling: Check if any trade is in post-goal boost window ---
+      const basePollIntervalMs = (this.settings?.in_play_poll_interval_seconds || this.defaults.in_play_poll_interval_seconds) * 1000;
+      const boostPollIntervalMs = (this.settings?.post_goal_poll_interval_seconds || this.defaults.post_goal_poll_interval_seconds) * 1000;
+      const boostWindowMs = (this.settings?.post_goal_poll_boost_seconds || this.defaults.post_goal_poll_boost_seconds) * 1000;
+      const nowMs = now.getTime();
+      
+      let needsBoost = false;
+      for (const trade of trades) {
+        const state = trade.state_data || {};
+        const phase = state.phase || 'WATCHING';
+        
+        // Boost applies to phases after goal detection (goal_wait, live, stop_loss_wait, stop_loss_active)
+        const boostEligiblePhases = ['GOAL_WAIT', 'LIVE', 'STOP_LOSS_WAIT', 'STOP_LOSS_ACTIVE'];
+        if (!boostEligiblePhases.includes(phase)) continue;
+        
+        // Check first goal boost window
+        if (state.spike_detected_at && (nowMs - state.spike_detected_at) < boostWindowMs) {
+          needsBoost = true;
+          break;
+        }
+        
+        // Check second goal boost window
+        if (state.second_goal_spike_at && (nowMs - state.second_goal_spike_at) < boostWindowMs) {
+          needsBoost = true;
+          break;
+        }
+      }
+      
+      // Update poll interval if needed (only when activeCount > 0, otherwise we stop polling below)
+      if (activeCount > 0) {
+        const targetIntervalMs = needsBoost ? boostPollIntervalMs : basePollIntervalMs;
+        this.updatePollInterval(targetIntervalMs);
+      }
 
       // If no active trades, check if games are starting soon before stopping polling
       if (activeCount === 0) {
@@ -1331,6 +1415,16 @@ class EplUnder25GoalReactStrategy {
         status: 'PENDING',
       }];
       
+      // Emit distinct event for original back placement (for log visibility)
+      await this.logEvent(trade.id, 'BACK_PLACED', {
+        bet_id: placeRes.betId,
+        bet_type: 'ORIGINAL',
+        stake,
+        price: entryPrice,
+        spread_tight: isTightSpread,
+        timestamp: placedAt,
+      });
+      
       // CRITICAL FIX: Wait to verify back order actually matched BEFORE placing lay
       // Goal reactions can cause market suspensions - back might not match
       await this.waitAndVerifyBackThenPlaceLay(trade, state, placeRes.betId, stake, entryPrice, sessionToken, market);
@@ -1556,6 +1650,18 @@ class EplUnder25GoalReactStrategy {
               matchedAt: null,
               status: 'PENDING',
               spreadGuardrail: isTightSpread ? 'TIGHT_SPREAD' : 'ONE_TICK_BELOW_LAY',
+            });
+            
+            // Emit distinct event for retry back placement (for log visibility)
+            await this.logEvent(trade.id, 'BACK_RETRY_PLACED', {
+              bet_id: retryRes.betId,
+              bet_type: 'RETRY',
+              stake: intendedRetrySize,
+              price: retryPrice,
+              spread_guardrail: isTightSpread ? 'TIGHT_SPREAD' : 'ONE_TICK_BELOW_LAY',
+              original_bet_id: backBetId,
+              original_matched: backMatchedSize,
+              timestamp: retryPlacedAt,
             });
             
             // ===== STEP 5: Wait up to 60s for retry to match =====
@@ -1791,6 +1897,10 @@ class EplUnder25GoalReactStrategy {
         selection_id: market.selectionId,
       });
       
+      // Store position entered timestamp for exposure time calculation
+      const positionEnteredAt = Date.now();
+      state.position_entered_at = positionEnteredAt;
+      
       await this.logEvent(trade.id, 'POSITION_ENTERED', { 
         entry_price: backMatchedPrice,
         stake: backMatchedSize,
@@ -1808,7 +1918,7 @@ class EplUnder25GoalReactStrategy {
           matchedPrice: backMatchedPrice,
           status: 'FULLY_MATCHED',
         }],
-        timestamp: new Date().toISOString(),
+        timestamp: new Date(positionEnteredAt).toISOString(),
       });
     } else {
       // Lay failed - position is exposed, flag critical error
@@ -2013,11 +2123,18 @@ class EplUnder25GoalReactStrategy {
         const actualMatchedSize = orderDetails.sizeMatched || 0;
         const layMatchedPrice = orderDetails.averagePriceMatched || state.target_lay_price || trade.lay_price;
         
-        this.logger.log(`[strategy:${STRATEGY_KEY}] 🏆 WIN! Lay verified matched: £${actualMatchedSize} @ ${layMatchedPrice}`);
+        const profitTargetHitAt = Date.now();
+        
+        // Calculate exposure time (aligned with exposure-stats endpoint: POSITION_ENTERED → PROFIT_TARGET_HIT)
+        const exposureSeconds = state.position_entered_at 
+          ? Math.floor((profitTargetHitAt - state.position_entered_at) / 1000)
+          : null;
+        
+        this.logger.log(`[strategy:${STRATEGY_KEY}] 🏆 WIN! Lay verified matched: £${actualMatchedSize} @ ${layMatchedPrice}${exposureSeconds != null ? ` | exposure: ${exposureSeconds}s` : ''}`);
         
         state.phase = PHASE.COMPLETED;
         state.exit_price = layMatchedPrice;
-        state.exit_time = Date.now();
+        state.exit_time = profitTargetHitAt;
         state.exit_reason = 'PROFIT_TARGET';
         
         await this.settleTradeWithPnl(trade, state, 'WIN', { layPrice: layMatchedPrice, layStake: actualMatchedSize });
@@ -2026,7 +2143,8 @@ class EplUnder25GoalReactStrategy {
           exit_price: layMatchedPrice,
           lay_matched_verified: actualMatchedSize,
           lay_bet_id: layBetId,
-          timestamp: new Date().toISOString(),
+          exposure_seconds: exposureSeconds,
+          timestamp: new Date(profitTargetHitAt).toISOString(),
         });
         return;
       }

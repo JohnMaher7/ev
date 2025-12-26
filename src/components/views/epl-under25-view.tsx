@@ -971,6 +971,23 @@ function formatEventPayload(payload: Record<string, unknown>): string {
   // --- Time/context fields ---
   if (payload.mins_from_kickoff !== undefined) parts.push(`min: ${Number(payload.mins_from_kickoff).toFixed(0)}`);
   
+  // --- Exposure time (for PROFIT_TARGET_HIT) ---
+  if (payload.exposure_seconds !== undefined && payload.exposure_seconds !== null) {
+    const expSec = Number(payload.exposure_seconds);
+    if (expSec >= 60) {
+      const mins = Math.floor(expSec / 60);
+      const secs = expSec % 60;
+      parts.push(`exposure: ${mins}m ${secs.toString().padStart(2, '0')}s`);
+    } else {
+      parts.push(`exposure: ${expSec}s`);
+    }
+  }
+  
+  // --- Bet type (for BACK_PLACED / BACK_RETRY_PLACED) ---
+  if (payload.bet_type) parts.push(`type: ${payload.bet_type}`);
+  if (payload.spread_guardrail) parts.push(`spread: ${payload.spread_guardrail}`);
+  if (payload.original_matched !== undefined) parts.push(`orig_matched: £${Number(payload.original_matched).toFixed(2)}`);
+  
   // --- Bet ID (handle both cases) ---
   const betId = payload.betId || payload.bet_id || payload.lay_bet_id;
   if (betId) parts.push(`betId: ${String(betId).slice(0, 8)}...`);
