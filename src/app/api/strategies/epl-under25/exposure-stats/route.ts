@@ -210,6 +210,7 @@ export async function GET(request: NextRequest) {
     if (config.demoMode || !supabaseAdmin) {
       return NextResponse.json({ success: true, data: [] satisfies ExposureStat[] });
     }
+    const sb = supabaseAdmin;
 
     const keys: StrategyKey[] = strategyKey && STRATEGY_KEYS.includes(strategyKey as StrategyKey)
       ? [strategyKey as StrategyKey]
@@ -217,7 +218,7 @@ export async function GET(request: NextRequest) {
 
     const statuses = status ? [status] : Array.from(SETTLED_STATUSES);
 
-    let tradeQuery = supabaseAdmin
+    let tradeQuery = sb
       .from('strategy_trades')
       .select('id,strategy_key,betfair_event_id,kickoff_at,back_price,lay_price,realised_pnl,pnl,status,competition_name')
       .in('strategy_key', keys)
@@ -246,7 +247,7 @@ export async function GET(request: NextRequest) {
       const eventIds = trades.map((t) => t.betfair_event_id).filter(Boolean) as string[];
       const uniqueEventIds = Array.from(new Set(eventIds));
       if (uniqueEventIds.length > 0) {
-        const { data: fixtures, error: fixtureErr } = await supabaseAdmin
+        const { data: fixtures, error: fixtureErr } = await sb
           .from('strategy_fixtures')
           .select('betfair_event_id, competition, strategy_key')
           .in('strategy_key', keys)
@@ -284,7 +285,7 @@ export async function GET(request: NextRequest) {
 
     await Promise.all(
       chunks.map(async (batchIds) => {
-        const { data, error } = await supabaseAdmin
+        const { data, error } = await sb
           .from('strategy_trade_events')
           .select('trade_id,event_type,occurred_at,payload')
           .in('trade_id', batchIds)
