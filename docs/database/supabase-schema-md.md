@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS strategy_trades (
         'goal_wait',
         'live',
         'stop_loss_wait',
-        'stop_loss_active'
+        'stop_loss_active',
+        'post_trade_monitor'  -- Shadow monitoring phase (tracks potential profit after exit/skip)
     )),
     back_order_ref TEXT,
     back_price DECIMAL(10,4),
@@ -60,7 +61,25 @@ CREATE TABLE IF NOT EXISTS strategy_trades (
     back_placed_at TIMESTAMP WITH TIME ZONE,
     lay_placed_at TIMESTAMP WITH TIME ZONE,
     needs_check_at TIMESTAMP WITH TIME ZONE,
-    state_data JSONB DEFAULT '{}'::JSONB
+    state_data JSONB DEFAULT '{}'::JSONB,
+    -- New columns for exposure tracking
+    exposure_time_seconds INTEGER,  -- Time in seconds between back matched and lay matched (in-play only). For prematch: only counts time after kickoff. Cannot be negative.
+    back_price_at_kickoff DECIMAL(10,4),  -- Market back price captured 1 minute before kickoff (prematch strategy only, used for future analysis)
+    
+    -- Second goal recovery telemetry (goalreact strategy only)
+    second_goal_settled_price DECIMAL(10,4),  -- Back price after 90s verification wait following 2nd goal (goalreact only, used for stop-loss optimization analysis)
+    min_price_after_2nd_goal DECIMAL(10,4),   -- Lowest back price observed from 2nd goal detection until trade completion (goalreact only, measures best potential recovery)
+    
+    -- Shadow monitoring / post-trade analytics columns
+    theoretical_entry_price DECIMAL(10,4),  -- Entry price for skipped/shadow trades (used for "what-if" analytics)
+    min_post_entry_price DECIMAL(10,4),     -- Lowest price observed during post-trade monitoring (best potential profit point)
+    max_potential_profit_pct DECIMAL(10,2), -- Maximum profit % achievable based on min_post_entry_price vs entry price
+    seconds_to_max_profit INTEGER,          -- Seconds from entry to reaching max_potential_profit_pct
+    seconds_to_10_pct INTEGER,              -- Seconds from entry to first reaching 10% profit threshold
+    seconds_to_15_pct INTEGER,              -- Seconds from entry to first reaching 15% profit threshold
+    seconds_to_20_pct INTEGER,              -- Seconds from entry to first reaching 20% profit threshold
+    seconds_to_25_pct INTEGER,              -- Seconds from entry to first reaching 25% profit threshold
+    seconds_to_30_pct INTEGER               -- Seconds from entry to first reaching 30% profit threshold
 );
 
 CREATE TABLE IF NOT EXISTS strategy_trade_events (
@@ -79,7 +98,8 @@ CREATE TABLE IF NOT EXISTS strategy_trade_events (
 -- Event types for epl_under25_goalreact:
 -- TRADE_CREATED, WATCHING_STARTED, GOAL_DETECTED, GOAL_AFTER_CUTOFF,
 -- GOAL_DISALLOWED, PRICE_OUT_OF_RANGE, POSITION_ENTERED, ENTRY_FAILED,
--- SECOND_GOAL_DETECTED, STOP_LOSS_BASELINE_SET, PROFIT_TARGET_HIT, STOP_LOSS_EXIT
+-- SECOND_GOAL_DETECTED, STOP_LOSS_BASELINE_SET, PROFIT_TARGET_HIT, STOP_LOSS_EXIT,
+-- SHADOW_MONITORING_STARTED, SHADOW_MILESTONE_REACHED, SHADOW_MONITORING_COMPLETED
 
 CREATE TABLE IF NOT EXISTS strategy_settings (
     strategy_key TEXT PRIMARY KEY,
@@ -201,5 +221,42 @@ CREATE INDEX IF NOT EXISTS idx_trade_events_goal_price_snapshot
 CREATE INDEX IF NOT EXISTS idx_trade_events_snapshot_timing
     ON strategy_trade_events(((payload->>'seconds_after_goal_target')::int))
     WHERE event_type = 'GOAL_PRICE_SNAPSHOT';
+
+-- SHADOW MONITORING ANALYTICS VIEW (GoalReactive)
+-- Provides easy access to shadow monitoring results for completed/skipped trades
+CREATE OR REPLACE VIEW goalreact_shadow_monitoring AS
+SELECT
+    t.id,
+    t.event_name,
+    t.competition_name,
+    t.kickoff_at,
+    t.status,
+    t.back_price,
+    t.theoretical_entry_price,
+    COALESCE(t.back_price, t.theoretical_entry_price) AS effective_entry_price,
+    t.min_post_entry_price,
+    t.max_potential_profit_pct,
+    t.seconds_to_max_profit,
+    t.seconds_to_10_pct,
+    t.seconds_to_15_pct,
+    t.seconds_to_20_pct,
+    t.seconds_to_25_pct,
+    t.seconds_to_30_pct,
+    t.realised_pnl,
+    (t.state_data->>'is_shadow_trade')::boolean AS is_shadow_trade,
+    t.state_data->>'skip_reason' AS skip_reason,
+    t.state_data->>'monitor_end_reason' AS monitor_end_reason
+FROM strategy_trades t
+WHERE t.strategy_key = 'epl_under25_goalreact'
+  AND (t.max_potential_profit_pct IS NOT NULL OR t.theoretical_entry_price IS NOT NULL);
+
+-- Indexes for shadow monitoring analytics
+CREATE INDEX IF NOT EXISTS idx_strategy_trades_max_profit 
+    ON strategy_trades(max_potential_profit_pct) 
+    WHERE max_potential_profit_pct IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_strategy_trades_shadow_analysis 
+    ON strategy_trades(strategy_key, theoretical_entry_price, max_potential_profit_pct) 
+    WHERE theoretical_entry_price IS NOT NULL;
 ```
 

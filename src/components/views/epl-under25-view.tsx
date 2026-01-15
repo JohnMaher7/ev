@@ -58,7 +58,7 @@ interface TradeEvent {
 
 interface ExposureStat {
   strategy_key: string;
-  setting_key: 'lay_ticks_below_back' | 'profit_target_pct';
+  setting_key: 'lay_ticks_below_back' | 'profit_target_pct' | 'stop_loss_drift_pct';
   setting_value: number;
   average_exposure_seconds: number;
   total_trades: number;
@@ -80,6 +80,7 @@ interface TradesPage {
 const STRATEGY_NAMES: Record<string, string> = {
   epl_under25: 'Pre-Match Hedge',
   epl_under25_goalreact: 'Goal Reactive',
+  epl_over25_breakout: 'Over 2.5 Breakout',
 };
 
 const statusFilters = [
@@ -99,12 +100,15 @@ const statusFilters = [
   { value: "stop_loss_active", label: "Stop Loss Active" },
   { value: "completed", label: "Completed" },
   { value: "skipped", label: "Skipped" },
+  // Over 2.5 specific statuses
+  { value: "post_trade_monitor", label: "Post Trade Monitor" },
 ];
 
 const strategyFilters = [
   { value: "", label: "All Strategies" },
   { value: "epl_under25", label: "Pre-Match Hedge" },
   { value: "epl_under25_goalreact", label: "Goal Reactive" },
+  { value: "epl_over25_breakout", label: "Over 2.5 Breakout" },
 ];
 
 export default function EplUnder25View() {
@@ -294,9 +298,9 @@ export default function EplUnder25View() {
     <div className="space-y-6">
       <Card>
         <CardHeader>
-          <CardTitle>EPL Under 2.5 Strategy</CardTitle>
+          <CardTitle>EPL Goals Strategies</CardTitle>
           <CardDescription>
-            Monitor automated back/lay trades and adjust runtime parameters. Toggle the strategy using environment variable `ENABLE_EPL_UNDER25_STRATEGY`.
+            Monitor automated back/lay trades across Pre-Match Hedge, Goal Reactive, and Over 2.5 Breakout strategies.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
@@ -472,7 +476,9 @@ function ExposureStatsSection({
             const settingLabel =
               row.setting_key === 'lay_ticks_below_back'
                 ? `${row.setting_value} ticks below`
-                : `${row.setting_value}% profit target`;
+                : row.setting_key === 'stop_loss_drift_pct'
+                  ? `${row.setting_value}% stop loss drift`
+                  : `${row.setting_value}% profit target`;
             const avg = formatDurationSeconds(row.average_exposure_seconds);
             const subtitle = `${row.total_trades} counted • ${row.losing_trades_excluded} losers excluded`;
             const pnlIntent = row.net_pnl >= 0 ? "positive" : "negative";
@@ -552,7 +558,7 @@ function CompetitionProfitSummary({
     );
   }
   if (competitions.length === 0) return null;
-  
+
   return (
     <div className="space-y-2">
       <h3 className="text-sm font-medium text-[var(--color-text-muted)]">Profit by Competition</h3>
@@ -640,7 +646,7 @@ function Filters({
           ))}
         </select>
       </div>
-      
+
       {/* Row 2: Competition and Date filters */}
       <div className="flex flex-wrap items-center gap-3">
         <label className="text-xs text-[var(--color-text-muted)]">Competition</label>
@@ -891,10 +897,10 @@ function TradeLogsPanel({ tradeId }: { tradeId: string }) {
       <div className="space-y-1">
         {events.map((event) => {
           // Use payload timestamp if available (more accurate), fallback to occurred_at
-          const displayTime = event.payload?.timestamp 
+          const displayTime = event.payload?.timestamp
             ? String(event.payload.timestamp)
             : event.occurred_at;
-          
+
           return (
             <div
               key={event.id}
@@ -919,10 +925,10 @@ function TradeLogsPanel({ tradeId }: { tradeId: string }) {
 
 function formatEventPayload(payload: Record<string, unknown>): string {
   if (!payload || Object.keys(payload).length === 0) return '';
-  
+
   // Extract key fields for display
   const parts: string[] = [];
-  
+
   // --- Goal price snapshot (special formatting for t+30/60/90/120 snapshots) ---
   if (payload.seconds_after_goal_target !== undefined) {
     const target = payload.seconds_after_goal_target;
@@ -936,7 +942,7 @@ function formatEventPayload(payload: Record<string, unknown>): string {
     if (payload.goal_number) parts.push(`goal: #${payload.goal_number}`);
     return parts.join(' | ');
   }
-  
+
   // --- Pre-match hedge fields ---
   if (payload.price) parts.push(`price: ${payload.price}`);
   if (payload.stake) parts.push(`stake: ${payload.stake}`);
@@ -950,7 +956,7 @@ function formatEventPayload(payload: Record<string, unknown>): string {
     parts.push(`P&L: ${pnl >= 0 ? '+' : ''}£${pnl.toFixed(2)}`);
   }
   if (payload.outcome) parts.push(`outcome: ${payload.outcome}`);
-  
+
   // --- Goal reactive fields ---
   if (payload.price_after_goal) parts.push(`price_after_goal: ${payload.price_after_goal}`);
   if (payload.price_entered) parts.push(`price_entered: ${payload.price_entered}`);
@@ -961,16 +967,16 @@ function formatEventPayload(payload: Record<string, unknown>): string {
   if (payload.baseline_price) parts.push(`baseline: ${payload.baseline_price}`);
   if (payload.stop_loss_baseline) parts.push(`SL_baseline: ${payload.stop_loss_baseline}`);
   if (payload.goal_number) parts.push(`goal: #${payload.goal_number}`);
-  
+
   // --- Percentage fields ---
   if (payload.price_change_pct) parts.push(`change: ${Number(payload.price_change_pct).toFixed(1)}%`);
   if (payload.profit_pct) parts.push(`profit: ${Number(payload.profit_pct).toFixed(1)}%`);
   if (payload.drop_pct) parts.push(`drop: ${Number(payload.drop_pct).toFixed(1)}%`);
   if (payload.stop_loss_pct) parts.push(`SL_target: ${payload.stop_loss_pct}%`);
-  
+
   // --- Time/context fields ---
   if (payload.mins_from_kickoff !== undefined) parts.push(`min: ${Number(payload.mins_from_kickoff).toFixed(0)}`);
-  
+
   // --- Exposure time (for PROFIT_TARGET_HIT) ---
   if (payload.exposure_seconds !== undefined && payload.exposure_seconds !== null) {
     const expSec = Number(payload.exposure_seconds);
@@ -982,20 +988,20 @@ function formatEventPayload(payload: Record<string, unknown>): string {
       parts.push(`exposure: ${expSec}s`);
     }
   }
-  
+
   // --- Bet type (for BACK_PLACED / BACK_RETRY_PLACED) ---
   if (payload.bet_type) parts.push(`type: ${payload.bet_type}`);
   if (payload.spread_guardrail) parts.push(`spread: ${payload.spread_guardrail}`);
   if (payload.original_matched !== undefined) parts.push(`orig_matched: £${Number(payload.original_matched).toFixed(2)}`);
-  
+
   // --- Bet ID (handle both cases) ---
   const betId = payload.betId || payload.bet_id || payload.lay_bet_id;
   if (betId) parts.push(`betId: ${String(betId).slice(0, 8)}...`);
-  
+
   // --- Error/status fields ---
   if (payload.errorCode) parts.push(`error: ${payload.errorCode}`);
   if (payload.reason) parts.push(`reason: ${payload.reason}`);
-  
+
   return parts.join(' | ');
 }
 

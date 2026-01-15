@@ -6,7 +6,7 @@ export const dynamic = 'force-dynamic';
 export default function Page() {
   return (
     <AppLayout
-      title="EPL Under 2.5 Strategy"
+      title="EPL Goals Strategies"
       description="Monitor automated back/lay trades and adjust runtime parameters."
     >
       <EplUnder25View />

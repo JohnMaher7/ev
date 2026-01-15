@@ -3,13 +3,14 @@ import { NextRequest, NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
 import { config } from '@/lib/config';
 
-// Support both strategies
+// Support all three strategies
 const STRATEGY_KEYS = [
   config.strategies.eplUnder25.key,
   config.strategies.eplUnder25GoalReact.key,
+  config.strategies.eplOver25Breakout.key,
 ];
 
-type StrategyKey = typeof config.strategies.eplUnder25.key | typeof config.strategies.eplUnder25GoalReact.key;
+type StrategyKey = typeof config.strategies.eplUnder25.key | typeof config.strategies.eplUnder25GoalReact.key | typeof config.strategies.eplOver25Breakout.key;
 
 const SETTLED_STATUSES = ['hedged', 'completed'] as const;
 
@@ -227,7 +228,7 @@ export async function GET(request: NextRequest) {
 
     if (config.demoMode || !supabaseAdmin) {
       let demoData = demoTrades();
-      
+
       // Apply filters to demo data
       if (status) {
         demoData = demoData.filter(t => t.status === status);
@@ -244,14 +245,14 @@ export async function GET(request: NextRequest) {
       if (dateTo) {
         demoData = demoData.filter(t => t.kickoff_at && t.kickoff_at <= dateTo);
       }
-      
+
       // Sort by kickoff_at descending (most recent first)
       demoData.sort((a, b) => {
         const aTime = a.kickoff_at ? new Date(a.kickoff_at).getTime() : 0;
         const bTime = b.kickoff_at ? new Date(b.kickoff_at).getTime() : 0;
         return bTime - aTime;
       });
-      
+
       return NextResponse.json({ success: true, data: demoData, cursor: null });
     }
 

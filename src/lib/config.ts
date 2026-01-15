@@ -1,7 +1,7 @@
 export const config = {
   // The Odds API Configuration
   oddsApiKey: process.env.ODDS_API_KEY || '',
-  
+
   // App Configuration
   appTimezone: process.env.NEXT_PUBLIC_APP_TIMEZONE || 'Europe/London',
   // DEPRECATED: bookmakerAllowlist no longer filters API requests (we now fetch ALL bookmakers for better consensus)
@@ -10,31 +10,31 @@ export const config = {
   exchangeCommissionDefault: parseFloat(process.env.EXCHANGE_COMMISSION_DEFAULT || '0.02'),
   pollMinutes: parseInt(process.env.POLL_MINUTES || '60'),
   demoMode: process.env.DEMO_MODE === 'true',
-  
+
   // Supabase Configuration
   supabaseUrl: process.env.NEXT_PUBLIC_SUPABASE_URL || '',
   supabaseAnonKey: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '',
   supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || '',
-  
+
   // Vercel Configuration
   vercelUrl: process.env.VERCEL_URL || '',
-  
+
   // Alert thresholds
   alertThresholds: {
     solid: 0.01, // 1 percentage point (lowered from 2%)
     scout: 0.03, // 3 percentage points (lowered from 5%)
     exchangeValue: 0.02, // 2 percentage points (lowered from 3%)
   },
-  
+
   // Near-miss tracking
   nearMissThreshold: 0.5, // 50% of threshold counts as near-miss
-  
+
   // Exchange stability threshold
   exchangeStabilityThreshold: {
     min: 0.98,
     max: 1.02,
   },
-  
+
   // Stake limits
   stakeLimits: {
     solid: {
@@ -79,6 +79,19 @@ export const config = {
       goalDetectionPct: parseFloat(process.env.GOALREACT_GOAL_DETECTION_PCT || '30'),
       profitTargetPct: parseFloat(process.env.GOALREACT_PROFIT_TARGET_PCT || '10'),
       stopLossPct: parseFloat(process.env.GOALREACT_STOP_LOSS_PCT || '15'),
+    },
+    eplOver25Breakout: {
+      key: 'epl_over25_breakout',
+      name: 'Over 2.5 Breakout',
+      enabled: process.env.ENABLE_EPL_OVER25_BREAKOUT_STRATEGY === 'true',
+      defaultStake: parseFloat(process.env.OVER25_DEFAULT_STAKE || '10'),
+      waitAfterGoalSeconds: parseInt(process.env.OVER25_WAIT_AFTER_GOAL || '60', 10),
+      goalCutoffMinutes: parseInt(process.env.OVER25_GOAL_CUTOFF || '75', 10),
+      minEntryPrice: parseFloat(process.env.OVER25_MIN_ENTRY_PRICE || '1.5'),
+      maxEntryPrice: parseFloat(process.env.OVER25_MAX_ENTRY_PRICE || '5.0'),
+      goalDetectionPct: parseFloat(process.env.OVER25_GOAL_DETECTION_PCT || '30'),
+      entryBufferPct: parseFloat(process.env.OVER25_ENTRY_BUFFER_PCT || '2'),
+      stopLossDriftPct: parseFloat(process.env.OVER25_STOP_LOSS_DRIFT_PCT || '10'),
     },
   },
 } as const;

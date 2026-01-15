@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { config } from '@/lib/config';
 import { supabaseAdmin } from '@/lib/supabase';
 
-type StrategyKey = typeof config.strategies.eplUnder25.key | typeof config.strategies.eplUnder25GoalReact.key;
+type StrategyKey = typeof config.strategies.eplUnder25.key | typeof config.strategies.eplUnder25GoalReact.key | typeof config.strategies.eplOver25Breakout.key;
 
 type StrategyTradeRow = {
   id: string;
@@ -27,7 +27,7 @@ type TradeEventRow = {
 
 type ExposureStat = {
   strategy_key: StrategyKey;
-  setting_key: 'lay_ticks_below_back' | 'profit_target_pct';
+  setting_key: 'lay_ticks_below_back' | 'profit_target_pct' | 'stop_loss_drift_pct';
   setting_value: number;
   average_exposure_seconds: number;
   total_trades: number;
@@ -35,7 +35,7 @@ type ExposureStat = {
   net_pnl: number;
 };
 
-const STRATEGY_KEYS: StrategyKey[] = [config.strategies.eplUnder25.key, config.strategies.eplUnder25GoalReact.key];
+const STRATEGY_KEYS: StrategyKey[] = [config.strategies.eplUnder25.key, config.strategies.eplUnder25GoalReact.key, config.strategies.eplOver25Breakout.key];
 
 const SETTLED_STATUSES = ['hedged', 'completed'] as const;
 
@@ -51,6 +51,14 @@ const REQUIRED_EVENT_TYPES = [
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
+}
+
+function chunk<T>(items: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    out.push(items.slice(i, i + size));
+  }
+  return out;
 }
 
 function parseIsoMs(value: string | null): number | null {
@@ -167,6 +175,11 @@ function inferSettingValueFromEvents(trade: StrategyTradeRow, tradeEvents: Trade
     return null;
   }
 
+  // Over 2.5 Breakout: skip exposure stats for now (no trades yet, exposure calculation TBD)
+  if (trade.strategy_key === config.strategies.eplOver25Breakout.key) {
+    return null;
+  }
+
   // Goal reactive: infer profit target from POSITION_ENTERED (entry back + target lay).
   const entered = getFirstEvent(tradeEvents, ['POSITION_ENTERED']);
   const payload = entered?.payload || {};
@@ -266,17 +279,24 @@ export async function GET(request: NextRequest) {
     }
 
     const tradeIds = filteredTrades.map((t) => t.id);
+    const chunks = chunk(tradeIds, 40);
+    const events: TradeEventRow[] = [];
 
-    const { data: eventsRaw, error: eventsErr } = await supabaseAdmin
-      .from('strategy_trade_events')
-      .select('trade_id,event_type,occurred_at,payload')
-      .in('trade_id', tradeIds)
-      .in('event_type', Array.from(REQUIRED_EVENT_TYPES))
-      .order('occurred_at', { ascending: true });
+    await Promise.all(
+      chunks.map(async (batchIds) => {
+        const { data, error } = await supabaseAdmin
+          .from('strategy_trade_events')
+          .select('trade_id,event_type,occurred_at,payload')
+          .in('trade_id', batchIds)
+          .in('event_type', Array.from(REQUIRED_EVENT_TYPES))
+          .order('occurred_at', { ascending: true });
 
-    if (eventsErr) throw new Error(eventsErr.message);
-
-    const events = (eventsRaw || []) as TradeEventRow[];
+        if (error) throw new Error(error.message);
+        if (data) {
+          events.push(...(data as TradeEventRow[]));
+        }
+      })
+    );
     const eventsByTradeId = new Map<string, TradeEventRow[]>();
     for (const ev of events) {
       const arr = eventsByTradeId.get(ev.trade_id) || [];
@@ -302,7 +322,11 @@ export async function GET(request: NextRequest) {
       const isLosing = pnl != null ? pnl < 0 : false;
 
       const setting_key: ExposureStat['setting_key'] =
-        trade.strategy_key === config.strategies.eplUnder25.key ? 'lay_ticks_below_back' : 'profit_target_pct';
+        trade.strategy_key === config.strategies.eplUnder25.key
+          ? 'lay_ticks_below_back'
+          : trade.strategy_key === config.strategies.eplOver25Breakout.key
+            ? 'stop_loss_drift_pct'
+            : 'profit_target_pct';
 
       const tradeEvents = eventsByTradeId.get(trade.id) || [];
       const setting = inferSettingValueFromEvents(trade, tradeEvents);
@@ -389,6 +413,10 @@ export async function GET(request: NextRequest) {
     );
   }
 }
+
+
+
+
 
 
 

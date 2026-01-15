@@ -19,7 +19,14 @@ const COMPETITION_MATCHERS = [
   /^UEFA Champions League$/i,    // Champions League
   /^UEFA Europa League$/i,  // UEFA Europa League
   /^Africa Cup of Nations$/i,  // Africa Cup of Nations
+  /^English Sky Bet Championship$/i,  // English Sky Bet Championship
+  /^Australian A-League Men$/i,  // Australian A-League Men
   /^English Football League Cup$/i,  // English Football League Cup
+  /^French Ligue 1$/i,  // French Ligue 1
+  /^Scottish Premiership$/i,  // Scottish Premiership
+  /^English FA Cup$/i,  // English FA Cup
+  /^Portuguese Primeira Liga$/i,  // Portuguese Primeira Liga
+  /^Spanish Super Cup$/i,  // Spanish Super Cup
 ];
 
 // Competition IDs from Betfair
@@ -31,7 +38,14 @@ const COMPETITION_IDS = [
   '228',       //UEFA Champions League
   '2005',      // UEFA Europa League
   '12209528',  // Africa Cup of Nations
+  '7129730',  // English Sky Bet Championship
+  '12117172',  // Australian A-League Men
   '2134',      // English Football League Cup
+  '55',        // French Ligue 1
+  '105',       // Scottish Premiership
+  '99',        // Portuguese Primeira Liga
+  '30558',     // English FA Cup
+  '12209520',  // Spanish Super Cup
 ];
 
 // --- Stake/Price Calculations ---

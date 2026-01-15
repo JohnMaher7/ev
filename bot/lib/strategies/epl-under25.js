@@ -21,7 +21,7 @@ function getDefaultSettings() {
   return {
     // Code is the source of truth for this strategy's settings.
     // (Avoid env overrides here to prevent accidental config drift / Supabase "reverts".)
-    default_stake: 200,
+    default_stake: 300,
     fixture_lookahead_days: 2,
     commission_rate: 0.0175,
     // Strategy-specific settings (stored in extra JSONB)
@@ -188,11 +188,12 @@ class EplUnder25Strategy {
     
     // Priority 1: Check for active trades that need monitoring
     // INCLUDES back_pending - we poll these to detect pre-match matches and place lay immediately
+    // INCLUDES post_trade_monitor - shadow monitoring (low priority but needs polling)
     const { data: activeTrades } = await this.supabase
       .from('strategy_trades')
       .select('id, status')
       .eq('strategy_key', STRATEGY_KEY)
-      .in('status', ['back_pending', 'back_matched', 'hedge_pending'])
+      .in('status', ['back_pending', 'back_matched', 'hedge_pending', 'post_trade_monitor'])
       .limit(1);
     
     if (activeTrades?.length > 0) {
@@ -1004,6 +1005,13 @@ class EplUnder25Strategy {
             else if (id === '228') competitionIdToName.set(id, 'UEFA Champions League');
             else if (id === '2005') competitionIdToName.set(id, 'UEFA Europa League');
             else if (id === '12209528') competitionIdToName.set(id, 'Africa Cup of Nations');
+            else if (id === '7129730') competitionIdToName.set(id, 'English Sky Bet Championship');
+            else if (id === '12117172') competitionIdToName.set(id, 'Australian A-League Men');
+            else if (id === '55') competitionIdToName.set(id, 'French Ligue 1');
+            else if (id === '105') competitionIdToName.set(id, 'Scottish Premiership');
+            else if (id === '99') competitionIdToName.set(id, 'Portuguese Primeira Liga');
+            else if (id === '30558') competitionIdToName.set(id, 'English FA Cup');
+            else if (id === '12209520') competitionIdToName.set(id, 'Spanish Super Cup');
             else if (id === '2134') competitionIdToName.set(id, 'English Football League Cup');
           }
         });
@@ -1396,7 +1404,7 @@ class EplUnder25Strategy {
         .from('strategy_trades')
         .select('*')
         .eq('strategy_key', STRATEGY_KEY)
-        .in('status', ['back_pending', 'back_matched', 'hedge_pending'])
+        .in('status', ['back_pending', 'back_matched', 'hedge_pending', 'post_trade_monitor'])
         .order('kickoff_at', { ascending: true });
 
       if (error) {
@@ -1417,15 +1425,47 @@ class EplUnder25Strategy {
         return;
       }
 
-      const counts = { back_pending: 0, back_matched: 0, hedge_pending: 0 };
+      // --- Priority Sorting: Process real-money trades FIRST ---
+      // Critical: Ensures shadow monitoring never delays real trade execution
+      const statusPriority = {
+        // Priority 1 - Real money at risk
+        'back_pending': 1,
+        'back_matched': 1,
+        'hedge_pending': 1,
+        // Priority 2 - Shadow monitoring (data collection only)
+        'post_trade_monitor': 2,
+      };
+      
+      trades.sort((a, b) => {
+        const priorityA = statusPriority[a.status] ?? 3;
+        const priorityB = statusPriority[b.status] ?? 3;
+        return priorityA - priorityB;
+      });
+      
+      // Count by priority for diagnostics
+      const realCount = trades.filter(t => statusPriority[t.status] === 1).length;
+      const shadowCount = trades.filter(t => statusPriority[t.status] === 2).length;
+      
+      if (shadowCount > 0) {
+        this.logger.log(`[strategy:epl_under25] 🚦 Traffic Control: ${realCount} real | ${shadowCount} shadow`);
+      }
+
+      const counts = { back_pending: 0, back_matched: 0, hedge_pending: 0, post_trade_monitor: 0 };
       trades.forEach(t => { if(counts[t.status] !== undefined) counts[t.status]++ });
-      this.logger.log(`[strategy:epl_under25] Active tick: ${trades.length} trades (states: back_pending=${counts.back_pending}, back_matched=${counts.back_matched}, hedge_pending=${counts.hedge_pending})`);
+      this.logger.log(`[strategy:epl_under25] Active tick: ${trades.length} trades (states: back_pending=${counts.back_pending}, back_matched=${counts.back_matched}, hedge_pending=${counts.hedge_pending}, post_trade_monitor=${counts.post_trade_monitor})`);
 
       const now = new Date();
       for (const trade of trades) {
         try {
+          // Data capture: back_price_at_kickoff (1 min before kickoff, regardless of trade status)
+          // This is purely for analysis - does not affect strategy logic
+          await this.captureBackPriceAtKickoff(trade, now);
+          
           if (trade.status === 'back_pending') {
             await this.checkBackOrder(trade, now);
+          } else if (trade.status === 'post_trade_monitor') {
+            // Shadow monitoring - separate handler with throttling
+            await this.handlePostTradeMonitor(trade, now);
           } else {
             await this.runStateMachine(trade, now);
           }
@@ -1453,10 +1493,56 @@ class EplUnder25Strategy {
     // Check if market has closed/settled (game ended)
     const book = await this.getMarketBookSafe(market.marketId, sessionToken, `phase-${phase}-book`);
     if (book && book.status === 'CLOSED') {
-      // Market closed - settle the trade with whatever outcome
-      this.logger.log(`[strategy:epl_under25] Market closed - settling trade (phase: ${phase})`);
-      await this.settleTradeWithPnl(trade, state);
+      // CRITICAL FIX: Market closed - verify lay order status before settling
+      // Don't assume lay matched - it may have been cancelled (e.g., 3rd goal scored)
+      this.logger.log(`[strategy:epl_under25] Market closed - verifying lay order status before settlement (phase: ${phase})`);
+      
+      // Determine which order to check (profit_order_id in MONITORING, recovery_order_id in RECOVERY_PENDING)
+      const activeOrderId = state.profit_order_id || state.recovery_order_id;
+      let verifiedLayStake = 0;
+      let verifiedLayPrice = trade.lay_price || 0;
+      
+      if (activeOrderId) {
+        const orderDetails = await this.getOrderDetailsSafe(activeOrderId, sessionToken, 'market-closed-verify');
+        
+        if (orderDetails) {
+          verifiedLayStake = orderDetails.sizeMatched || 0;
+          verifiedLayPrice = orderDetails.averagePriceMatched || trade.lay_price || 0;
+          
+          this.logger.log(`[strategy:epl_under25] Lay order ${activeOrderId} verification: matched=£${verifiedLayStake}, status=${orderDetails.status}`);
+          
+          if (verifiedLayStake === 0) {
+            this.logger.warn(`[strategy:epl_under25] ⚠️ CRITICAL: Lay order was CANCELLED (0 matched) - recording as FULL LOSS`);
+          }
+        } else {
+          // Order not found - likely cancelled/voided
+          this.logger.warn(`[strategy:epl_under25] ⚠️ Lay order ${activeOrderId} NOT FOUND - assuming cancelled (0 matched)`);
+          verifiedLayStake = 0;
+        }
+      } else {
+        this.logger.warn(`[strategy:epl_under25] ⚠️ No active lay order to verify - phase=${phase}`);
+      }
+      
+      // Mark as completed for settlement semantics (enables forced-loss handling when layStake is 0)
+      state.phase = 'COMPLETED';
+
+      // Settle with verified matched amounts (explicit 0 if cancelled)
+      await this.settleTradeWithPnl(trade, state, {
+        layStakeOverride: verifiedLayStake,
+        layPriceOverride: verifiedLayPrice,
+        partialLayMatched: state.partial_lay_matched || 0,
+        partialLayPrice: state.partial_lay_price || 0,
+        additionalPatch: { last_error: `MARKET_CLOSED_${phase}` },
+      });
       return;
+    }
+
+    // Capture actual kickoff time when market turns in-play
+    if (book && book.inplay === true && !state.actual_kickoff_time) {
+      state.actual_kickoff_time = Date.now();
+      this.logger.log(`[strategy:epl_under25] ⚽ Match started! Recording actual kickoff time.`);
+      await this.updateTrade(trade.id, { state_data: state });
+      updatedState = false; // Reset flag since we just persisted
     }
 
     // --- PHASE 1: INITIALIZATION & ORDER PLACEMENT ---
@@ -1522,6 +1608,8 @@ class EplUnder25Strategy {
           await this.settleTradeWithPnl(trade, state, {
             layStakeOverride: orderDetails.sizeMatched,
             layPriceOverride: orderDetails.averagePriceMatched || trade.lay_price,
+            partialLayMatched: state.partial_lay_matched || 0,
+            partialLayPrice: state.partial_lay_price || 0,
           });
         } else {
           // No lay matched - trade is exposed, need emergency hedge
@@ -1541,13 +1629,30 @@ class EplUnder25Strategy {
           this.logger.warn(`[strategy:epl_under25] ⚠️ Lay only partially matched: £${actualMatchedSize} of £${expectedSize}`);
         }
         
+        // Calculate exposure time: only count in-play time
+        const layMatchedAtMs = Date.now();
+        const layMatchedAt = new Date(layMatchedAtMs).toISOString();
+        const stateData = trade.state_data || {};
+        const backMatchedAt = stateData.position_entered_at || 0;
+        // Use actual kickoff time if available, fallback to scheduled kickoff
+        const actualKickoffTime = stateData.actual_kickoff_time || 0;
+        const scheduledKickoffTime = trade.kickoff_at ? new Date(trade.kickoff_at).getTime() : 0;
+        const kickoffTime = actualKickoffTime || scheduledKickoffTime;
+        const exposureStartTime = Math.max(backMatchedAt, kickoffTime);
+        const exposureTimeSeconds = exposureStartTime > 0 
+          ? Math.max(0, Math.floor((layMatchedAtMs - exposureStartTime) / 1000))
+          : null;
+        
+        this.logger.log(`[strategy:epl_under25] 🏆 Trade Completed: Profit Target Reached (matched £${actualMatchedSize})`);
+        this.logger.log(`[strategy:epl_under25]   📊 EXPOSURE TIME: ${exposureTimeSeconds != null ? `${exposureTimeSeconds}s (${(exposureTimeSeconds / 60).toFixed(1)} mins)` : 'N/A'}`);
+        
         // Lay order genuinely matched
-        const layMatchedAt = new Date().toISOString();
         await this.logEvent(trade.id, 'LAY_MATCHED', {
           betId: state.profit_order_id,
           lay_price: orderDetails.averagePriceMatched || state.lay_snapshot?.price || trade.lay_price,
           lay_stake: actualMatchedSize,
           expected_stake: expectedSize,
+          exposure_time_seconds: exposureTimeSeconds,
           timestamp: layMatchedAt,
         });
         
@@ -1555,8 +1660,10 @@ class EplUnder25Strategy {
         await this.settleTradeWithPnl(trade, state, {
           layStakeOverride: actualMatchedSize,
           layPriceOverride: orderDetails.averagePriceMatched || trade.lay_price,
+          exposureTimeSeconds: exposureTimeSeconds,
+          partialLayMatched: state.partial_lay_matched || 0,
+          partialLayPrice: state.partial_lay_price || 0,
         });
-        this.logger.log(`[strategy:epl_under25] Trade Completed: Profit Target Reached (matched £${actualMatchedSize})`);
         
         // Trigger smart scheduler to recalculate (trade completed)
         if (process.env.EPL_UNDER25_SCHEDULER_MODE === 'smart' || !process.env.EPL_UNDER25_SCHEDULER_MODE) {
@@ -1568,11 +1675,37 @@ class EplUnder25Strategy {
       const book = await this.getMarketBookSafe(market.marketId, sessionToken, 'phase2-book');
       const runner = book?.runners?.find(r => r.selectionId == market.selectionId);
       const currentBackPrice = runner?.ex?.availableToBack?.[0]?.price;
+      const currentLayPrice = runner?.ex?.availableToLay?.[0]?.price;
+
+      // --- LIVE TRACKING: Track min_post_entry_price during MONITORING phase ---
+      // This ensures we capture how close we got to profit BEFORE any goal occurs
+      if (currentLayPrice) {
+        // Initialize min_post_entry_price if null (use current lay price or entry price)
+        if (state.min_post_entry_price === null || state.min_post_entry_price === undefined) {
+          state.min_post_entry_price = currentLayPrice;
+          state.time_at_min_price = 0; // Just started tracking
+          this.logger.log(`[strategy:epl_under25] 📊 LIVE min_post_entry_price initialized: ${currentLayPrice}`);
+          updatedState = true;
+        } 
+        // Update if current price is lower (better potential profit)
+        else if (currentLayPrice < state.min_post_entry_price) {
+          const previousMin = state.min_post_entry_price;
+          state.min_post_entry_price = currentLayPrice;
+          const elapsedSeconds = state.position_entered_at 
+            ? Math.floor((Date.now() - state.position_entered_at) / 1000)
+            : 0;
+          state.time_at_min_price = elapsedSeconds;
+          this.logger.log(`[strategy:epl_under25] 📊 LIVE min_post_entry_price updated: ${previousMin} → ${currentLayPrice} (${elapsedSeconds}s into trade)`);
+          updatedState = true;
+        }
+      }
 
       if (currentBackPrice) {
         if (currentBackPrice > (state.last_stable_price * 1.30)) {
           // SPIKE DETECTED - 30% price movement indicates possible goal
+          // NOTE: min_post_entry_price is already tracked above and will be preserved in state
           this.logger.log(`[strategy:epl_under25] 🎯 Goal Detected (Price: ${currentBackPrice.toFixed(2)} > ${(state.last_stable_price * 1.30).toFixed(2)}) - Cancelling profit order`);
+          this.logger.log(`[strategy:epl_under25]   Min price reached before goal: ${state.min_post_entry_price || 'N/A'}`);
           
           // Cancel the profit lay order (with marketId for Betfair API)
           await this.cancelOrderSafe(state.profit_order_id, market.marketId, sessionToken, 'phase2-cancel-goal');
@@ -1593,6 +1726,8 @@ class EplUnder25Strategy {
               await this.settleTradeWithPnl(trade, state, {
                 layStakeOverride: matchedSize,
                 layPriceOverride: matchedPrice,
+                partialLayMatched: state.partial_lay_matched || 0,
+                partialLayPrice: state.partial_lay_price || 0,
               });
               
               await this.logEvent(trade.id, 'LAY_MATCHED_DURING_GOAL', {
@@ -1641,6 +1776,9 @@ class EplUnder25Strategy {
           state.spike_start_ts = Date.now();
           state.peak_price = currentBackPrice;
           state.lay_cancelled_on_goal = true;
+          // FREEZE FLAG: Prevent shadow monitor from overwriting min_post_entry_price after goal
+          state.goal_detected_during_live_trade = true;
+          state.min_price_frozen_at_goal = state.min_post_entry_price;  // Snapshot for audit trail
           updatedState = true;
           
           await this.logEvent(trade.id, 'GOAL_DETECTED_LAY_CANCELLED', {
@@ -1649,6 +1787,7 @@ class EplUnder25Strategy {
             spike_pct: ((currentBackPrice - state.last_stable_price) / state.last_stable_price * 100),
             partial_lay_matched: state.partial_lay_matched || 0,
             partial_lay_price: state.partial_lay_price || 0,
+            min_price_frozen: state.min_post_entry_price,  // Log frozen value
             timestamp: new Date().toISOString(),
           });
         } else {
@@ -1879,6 +2018,8 @@ class EplUnder25Strategy {
           await this.settleTradeWithPnl(trade, state, {
             layStakeOverride: orderDetails.sizeMatched,
             layPriceOverride: orderDetails.averagePriceMatched || state.recovery_target_price,
+            partialLayMatched: state.partial_lay_matched || 0,
+            partialLayPrice: state.partial_lay_price || 0,
           });
           
           await this.logEvent(trade.id, 'RECOVERY_PARTIAL_MATCH', {
@@ -1976,6 +2117,8 @@ class EplUnder25Strategy {
         await this.settleTradeWithPnl(trade, state, {
           layStakeOverride: actualMatchedSize,
           layPriceOverride: matchedPrice,
+          partialLayMatched: state.partial_lay_matched || 0,
+          partialLayPrice: state.partial_lay_price || 0,
         });
         
         // Trigger smart scheduler to recalculate (trade completed)
@@ -2040,15 +2183,33 @@ class EplUnder25Strategy {
     
     // Check market liquidity if available (Betfair API may expose totalMatched)
     const minLiquidity = this.settings.min_market_liquidity || this.defaults.min_market_liquidity;
+    const currentLayPrice = runner?.ex?.availableToLay?.[0]?.price;
+    
     if (book && typeof book.totalMatched === 'number') {
       if (book.totalMatched < minLiquidity) {
-        this.logger.log(`[strategy:epl_under25] Market liquidity too low (${book.totalMatched} < ${minLiquidity}) for ${trade.fixture_name} - cancelling trade`);
+        this.logger.log(`[strategy:epl_under25] Market liquidity too low (${book.totalMatched} < ${minLiquidity}) for ${trade.fixture_name} - transitioning to shadow monitoring`);
+        
+        // Shadow monitoring: Track price to collect data without real exposure
+        const shadowState = {
+          phase: 'POST_TRADE_MONITOR',
+          is_shadow_trade: true,
+          skip_reason: 'MARKET_LIQUIDITY_TOO_LOW',
+          theoretical_entry_price: currentLayPrice || null,
+          theoretical_entry_time: Date.now(),
+          monitor_started_at: Date.now(),
+          min_post_entry_price: currentLayPrice || null,
+          last_monitor_poll: 0,
+        };
+        
         await this.updateTrade(trade.id, {
-          status: 'cancelled',
+          status: 'post_trade_monitor',
+          state_data: shadowState,
+          theoretical_entry_price: currentLayPrice || null,
           last_error: `MARKET_LIQUIDITY_TOO_LOW: ${book.totalMatched} < ${minLiquidity}`,
         });
-        await this.logEvent(trade.id, 'TRADE_CANCELLED', {
+        await this.logEvent(trade.id, 'SHADOW_MONITORING_STARTED', {
           reason: 'MARKET_LIQUIDITY_TOO_LOW',
+          theoretical_entry_price: currentLayPrice,
           total_matched: book.totalMatched,
           min_liquidity: minLiquidity,
           timestamp: new Date().toISOString(),
@@ -2069,14 +2230,29 @@ class EplUnder25Strategy {
 
     const minPrice = this.settings.min_back_price || this.defaults.min_back_price;
     if (bestLayPrice < minPrice) {
-      this.logger.log(`[strategy:epl_under25] Lay price ${bestLayPrice} too low (min: ${minPrice}) for ${trade.fixture_name} - cancelling trade to stop polling`);
-      // Mark trade as cancelled to stop polling this match (saves API calls)
+      this.logger.log(`[strategy:epl_under25] Lay price ${bestLayPrice} too low (min: ${minPrice}) for ${trade.fixture_name} - transitioning to shadow monitoring`);
+      
+      // Shadow monitoring: Track price to collect data without real exposure
+      const shadowState = {
+        phase: 'POST_TRADE_MONITOR',
+        is_shadow_trade: true,
+        skip_reason: 'LAY_PRICE_TOO_LOW',
+        theoretical_entry_price: bestLayPrice,
+        theoretical_entry_time: Date.now(),
+        monitor_started_at: Date.now(),
+        min_post_entry_price: bestLayPrice,  // Initialize with current price
+        last_monitor_poll: 0,  // Allow immediate first poll
+      };
+      
       await this.updateTrade(trade.id, {
-        status: 'cancelled',
+        status: 'post_trade_monitor',
+        state_data: shadowState,
+        theoretical_entry_price: bestLayPrice,
         last_error: `LAY_PRICE_TOO_LOW: ${bestLayPrice} < ${minPrice}`,
       });
-      await this.logEvent(trade.id, 'TRADE_CANCELLED', {
+      await this.logEvent(trade.id, 'SHADOW_MONITORING_STARTED', {
         reason: 'LAY_PRICE_TOO_LOW',
+        theoretical_entry_price: bestLayPrice,
         lay_price: bestLayPrice,
         min_price: minPrice,
         timestamp: new Date().toISOString(),
@@ -2245,21 +2421,55 @@ class EplUnder25Strategy {
             const matchedStake = order.sizeMatched || trade.back_size || trade.target_stake || 0;
             const matchedPrice = order.averagePriceMatched || order.price;
             
-            this.logger.log(`[strategy:epl_under25] ✓ Back bet FULLY MATCHED @ ${matchedPrice} (£${matchedStake}) ${isPreMatch ? 'PRE-MATCH' : ''} - placing lay for green-up`);
+            // CRITICAL FIX: Check if this is a retry bet - combine with original matched amount
+            const stateData = trade.state_data || {};
+            const originalMatchedAmount = stateData.original_matched_amount || 0;
+            const originalMatchedPrice = stateData.original_matched_price || 0;
             
-            trade.back_matched_size = matchedStake;
-            trade.back_price = matchedPrice;
+            let totalStake = matchedStake;
+            let weightedAvgPrice = matchedPrice;
+            
+            if (originalMatchedAmount > 0 && originalMatchedPrice > 0) {
+                // This is a retry bet - combine with original
+                totalStake = originalMatchedAmount + matchedStake;
+                
+                // Calculate weighted average price: ((S1 * P1) + (S2 * P2)) / (S1 + S2)
+                const totalValue = (originalMatchedAmount * originalMatchedPrice) + (matchedStake * matchedPrice);
+                weightedAvgPrice = Math.round((totalValue / totalStake) * 100) / 100;
+                
+                this.logger.log(`[strategy:epl_under25] 🔗 COMBINING BETS:`);
+                this.logger.log(`[strategy:epl_under25]   Original: £${originalMatchedAmount} @ ${originalMatchedPrice}`);
+                this.logger.log(`[strategy:epl_under25]   Retry: £${matchedStake} @ ${matchedPrice}`);
+                this.logger.log(`[strategy:epl_under25]   TOTAL: £${totalStake} @ ${weightedAvgPrice} (weighted avg)`);
+            } else {
+                this.logger.log(`[strategy:epl_under25] ✓ Back bet FULLY MATCHED @ ${matchedPrice} (£${matchedStake}) ${isPreMatch ? 'PRE-MATCH' : ''} - placing lay for green-up`);
+            }
+            
+            trade.back_matched_size = totalStake;
+            trade.back_price = weightedAvgPrice;
+            
+            // Store position entered time for exposure calculation
+            const positionEnteredAt = now.getTime();
+            stateData.position_entered_at = positionEnteredAt;
+            await this.updateTrade(trade.id, { state_data: stateData });
+            
             await this.logEvent(trade.id, 'BACK_MATCHED', { 
               order,
               matched_price: matchedPrice,
               matched_size: matchedStake,
+              original_matched_amount: originalMatchedAmount,
+              original_matched_price: originalMatchedPrice,
+              total_stake: totalStake,
+              weighted_avg_price: weightedAvgPrice,
+              is_combined_bet: originalMatchedAmount > 0,
               pre_match: isPreMatch,
               timestamp: new Date().toISOString(),
             });
             
             // Place lay bet for green-up IMMEDIATELY (even pre-match)
             // Lay uses PERSIST so it stays when market goes in-play
-            await this.placeLayForGreenUp(trade, sessionToken, matchedStake, matchedPrice);
+            // CRITICAL: Use combined totalStake and weightedAvgPrice
+            await this.placeLayForGreenUp(trade, sessionToken, totalStake, weightedAvgPrice);
             return;
         }
 
@@ -2338,7 +2548,9 @@ class EplUnder25Strategy {
                     
                     if (amountToRetry <= 0) {
                         // Everything matched during cancel confirmation - proceed with green-up
+                        // Note: finalMatchedAmount already represents the TOTAL matched (original bet fully filled)
                         this.logger.log(`[strategy:epl_under25] Full stake matched during cancel confirmation - proceeding with lay`);
+                        this.logger.log(`[strategy:epl_under25]   Total matched: £${finalMatchedAmount} @ ${finalMatchedPrice}`);
                         trade.back_matched_size = finalMatchedAmount;
                         trade.back_price = finalMatchedPrice;
                         await this.updateTrade(trade.id, {
@@ -2515,8 +2727,16 @@ class EplUnder25Strategy {
 
         // Order partially matched or still unmatched at/after kickoff
         if (now >= kickoff) {
-            const matchedAmount = order.sizeMatched || 0;
+            const currentMatched = order.sizeMatched || 0;
             const unmatchedAmount = (order.sizeRemaining || 0);
+            
+            // CRITICAL FIX: Retrieve original matched amount from first bet (if retry occurred)
+            const stateData = trade.state_data || {};
+            const originalMatchedAmount = stateData.original_matched_amount || 0;
+            const originalMatchedPrice = stateData.original_matched_price || 0;
+            
+            // Calculate TOTAL matched (original + current)
+            const totalMatched = originalMatchedAmount + currentMatched;
             
             // Cancel any unmatched portion
             if (unmatchedAmount > 0) {
@@ -2527,26 +2747,61 @@ class EplUnder25Strategy {
                 }, 'cancelBack-kickoff');
             }
             
-            // If ANY amount matched, proceed with the matched amount
-            if (matchedAmount > 0) {
-                const matchedPrice = order.averagePriceMatched || order.price;
-                this.logger.log(`[strategy:epl_under25] ⚠️ PARTIAL MATCH: £${matchedAmount} of £${trade.back_size} @ ${matchedPrice} - placing lay for green-up on matched portion`);
+            // If ANY amount matched (including original), proceed with the matched amount
+            if (totalMatched > 0) {
+                const currentMatchedPrice = order.averagePriceMatched || order.price;
                 
-                trade.back_matched_size = matchedAmount;
-                trade.back_price = matchedPrice;
+                let finalStake = totalMatched;
+                let finalPrice = currentMatchedPrice;
+                
+                // If we have BOTH original and current matches, calculate weighted average
+                if (originalMatchedAmount > 0 && originalMatchedPrice > 0 && currentMatched > 0) {
+                    // Calculate weighted average price: ((S1 * P1) + (S2 * P2)) / (S1 + S2)
+                    const totalValue = (originalMatchedAmount * originalMatchedPrice) + (currentMatched * currentMatchedPrice);
+                    finalPrice = Math.round((totalValue / finalStake) * 100) / 100;
+                    
+                    this.logger.log(`[strategy:epl_under25] 🔗 COMBINING BOTH BETS AT KICKOFF:`);
+                    this.logger.log(`[strategy:epl_under25]   Original (cancelled): £${originalMatchedAmount} @ ${originalMatchedPrice}`);
+                    this.logger.log(`[strategy:epl_under25]   Retry (partial): £${currentMatched} @ ${currentMatchedPrice}`);
+                    this.logger.log(`[strategy:epl_under25]   TOTAL MATCHED: £${finalStake} @ ${finalPrice} (weighted avg)`);
+                } else if (originalMatchedAmount > 0 && currentMatched === 0) {
+                    // Only original matched, retry completely unmatched
+                    finalStake = originalMatchedAmount;
+                    finalPrice = originalMatchedPrice;
+                    this.logger.log(`[strategy:epl_under25] ⚠️ Retry bet COMPLETELY UNMATCHED at kickoff`);
+                    this.logger.log(`[strategy:epl_under25]   Using ORIGINAL matched amount: £${finalStake} @ ${finalPrice}`);
+                } else {
+                    // Only current matched (no retry was attempted, or retry fully matched)
+                    this.logger.log(`[strategy:epl_under25] ⚠️ PARTIAL MATCH: £${currentMatched} of £${trade.back_size} @ ${currentMatchedPrice} - placing lay for green-up on matched portion`);
+                }
+                
+                trade.back_matched_size = finalStake;
+                trade.back_price = finalPrice;
+                
+                // Store position entered time for exposure calculation
+                stateData.position_entered_at = now.getTime();
+                await this.updateTrade(trade.id, { state_data: stateData });
+                
                 await this.logEvent(trade.id, 'BACK_PARTIALLY_MATCHED', { 
                     order, 
-                    matchedAmount,
-                    unmatchedAmount,
-                    matchedPrice,
+                    current_matched: currentMatched,
+                    unmatched_amount: unmatchedAmount,
+                    current_matched_price: currentMatchedPrice,
+                    original_matched_amount: originalMatchedAmount,
+                    original_matched_price: originalMatchedPrice,
+                    total_matched: finalStake,
+                    final_weighted_price: finalPrice,
+                    is_combined_bet: originalMatchedAmount > 0 && currentMatched > 0,
                     timestamp: new Date().toISOString(),
                 });
                 
-                // Place lay bet for green-up on the matched portion only
-                await this.placeLayForGreenUp(trade, sessionToken, matchedAmount, matchedPrice);
+                // Place lay bet for green-up on the TOTAL matched portion
+                // CRITICAL: Use finalStake and finalPrice (not just current order)
+                await this.placeLayForGreenUp(trade, sessionToken, finalStake, finalPrice);
             } else {
-                // Completely unmatched - cancel and terminate (no lay needed)
+                // BOTH original and retry completely unmatched - cancel and terminate
                 this.logger.log(`[strategy:epl_under25] ✗ Back bet COMPLETELY UNMATCHED at kickoff - terminating trade (no exposure)`);
+                this.logger.log(`[strategy:epl_under25]   Original matched: £${originalMatchedAmount}, Retry matched: £${currentMatched}, Total: £${totalMatched}`);
                 await this.updateTrade(trade.id, { 
                     status: 'cancelled', 
                     back_stake: 0,
@@ -2556,7 +2811,10 @@ class EplUnder25Strategy {
                 });
                 trade.status = 'cancelled';
                 await this.logEvent(trade.id, 'BACK_CANCELLED', { 
-                    order, 
+                    order,
+                    original_matched_amount: originalMatchedAmount,
+                    retry_matched_amount: currentMatched,
+                    total_matched: totalMatched,
                     reason: 'Completely unmatched at kickoff - no lay placed, no exposure' 
                 });
             }
@@ -2735,6 +2993,10 @@ class EplUnder25Strategy {
       return;
     }
 
+    // Data capture: back_price_at_kickoff (1 min before kickoff, for scheduled trades)
+    // This is purely for analysis - does not affect strategy logic
+    await this.captureBackPriceAtKickoff(trade, now);
+
     if (minsToKick <= leadTime && minsToKick > 0) {
       await this.placeBackOrder(trade, trigger);
     }
@@ -2768,6 +3030,9 @@ class EplUnder25Strategy {
       layStakeOverride,
       layPriceOverride,
       additionalPatch = {},
+      exposureTimeSeconds = null,
+      partialLayMatched = 0,
+      partialLayPrice = 0,
     } = options;
 
     const commission = this.settings?.commission_rate ?? this.defaults.commission_rate;
@@ -2783,16 +3048,46 @@ class EplUnder25Strategy {
     );
     const backPrice = trade.back_price || trade.back_price_snapshot || trade.hedge_target_price;
     
-    // FIX: Use || to skip explicit zeros in lay data
-    // layStakeOverride takes priority (for manual overrides)
-    // then lay_matched_size (actual matched), then lay_size (requested)
-    const layStake = Number(
-      layStakeOverride ||
-      trade.lay_matched_size ||
-      trade.lay_size ||
-      0,
-    );
-    const layPrice = layPriceOverride || trade.lay_price || trade.hedge_target_price || 0;
+    // CRITICAL FIX: Explicit type check to handle 0 matched stake correctly
+    // Using || would treat 0 as falsy and fall back to trade.lay_size (phantom match bug)
+    let currentLayStake = 0;
+    if (typeof layStakeOverride === 'number') {
+      // layStakeOverride parameter passed (including 0 for cancelled orders)
+      currentLayStake = layStakeOverride;
+    } else if (trade.lay_matched_size !== undefined && trade.lay_matched_size !== null) {
+      // Use actual matched size from trade record
+      currentLayStake = trade.lay_matched_size;
+    } else {
+      // Fallback to requested size (for legacy records)
+      currentLayStake = trade.lay_size || 0;
+    }
+    currentLayStake = Number(currentLayStake);
+    
+    // CRITICAL FIX: Aggregate partial lay matches (profit target) with stop-loss lay
+    // Without this, partial matches are lost from P&L calculation
+    let aggregateLayStake = currentLayStake;
+    let aggregateLayPrice = layPriceOverride || trade.lay_price || trade.hedge_target_price || 0;
+    
+    if (partialLayMatched > 0 && partialLayPrice > 0) {
+      // Combine partial match with stop-loss/recovery lay
+      const totalLayStake = partialLayMatched + currentLayStake;
+      
+      if (totalLayStake > 0) {
+        // Weighted average price: (partial_stake * partial_price + current_stake * current_price) / total_stake
+        aggregateLayPrice = (
+          (partialLayMatched * partialLayPrice) + (currentLayStake * (layPriceOverride || trade.lay_price || 0))
+        ) / totalLayStake;
+        aggregateLayStake = totalLayStake;
+      }
+      
+      this.logger.log(`[strategy:epl_under25] Aggregating lay positions:`);
+      this.logger.log(`[strategy:epl_under25]   Partial (profit target): £${partialLayMatched.toFixed(2)} @ ${partialLayPrice.toFixed(2)}`);
+      this.logger.log(`[strategy:epl_under25]   Stop-loss/Recovery: £${currentLayStake.toFixed(2)} @ ${(layPriceOverride || trade.lay_price || 0).toFixed(2)}`);
+      this.logger.log(`[strategy:epl_under25]   Aggregate: £${aggregateLayStake.toFixed(2)} @ ${aggregateLayPrice.toFixed(2)} (weighted avg)`);
+    }
+    
+    const layStake = aggregateLayStake;
+    const layPrice = aggregateLayPrice;
     
     // Validation logging - show exactly what values are being used
     const eventName = trade.event_name || trade.fixture_name || trade.event_id || 'Unknown';
@@ -2801,8 +3096,8 @@ class EplUnder25Strategy {
     this.logger.log(`[strategy:epl_under25]   Lay:  £${layStake} @ ${layPrice} (matched=${trade.lay_matched_size}, size=${trade.lay_size}, override=${layStakeOverride})`);
     this.logger.log(`[strategy:epl_under25]   Commission: ${(commission * 100).toFixed(2)}%`);
     
-    // Calculate P&L - now returns null if lay data is missing
-    const realised = computeRealisedPnlSnapshot({
+    // Calculate P&L
+    let realised = computeRealisedPnlSnapshot({
       backStake,
       backPrice,
       layStake,
@@ -2810,20 +3105,79 @@ class EplUnder25Strategy {
       commission,
     });
 
+    // --- FIX: Handle Full Loss on Market Closure (Zero Lay Match) ---
+    // If PnL is null, it means layStake was 0.
+    // If we are settling because the market is CLOSED (or cancelled/monitor phase),
+    // this implies a 100% loss of the back stake.
+    if (realised === null && (state?.phase === 'COMPLETED' || trade.status === 'cancelled' || trade.status === 'post_trade_monitor')) {
+      // STRICT CHECK: Only force loss if we have a back stake but ABSOLUTELY NO lay stake.
+      // (Partial matches return a valid negative number, so they won't trigger this).
+      if (backStake > 0 && layStake === 0) {
+        realised = -backStake;
+        this.logger.log(`[strategy:epl_under25] 📉 Market settled with NO lay match - forcing PnL to FULL LOSS: £${realised.toFixed(2)}`);
+      }
+    }
+
     // Handle null P&L (lay not matched - trade incomplete)
     if (realised === null) {
       this.logger.warn(`[strategy:epl_under25] ⚠️ Cannot calculate P&L - lay data missing (layStake=${layStake}, layPrice=${layPrice})`);
       this.logger.warn(`[strategy:epl_under25]   Trade ${eventName} will be marked hedged but P&L is NULL (incomplete data)`);
     }
 
+    // Calculate exposure time (only in-play time - can't be negative)
+    // For prematch: exposure = lay_matched_time - max(back_matched_time, actual_kickoff_time)
+    // This ensures we only count in-play exposure, not pre-match waiting time
+    const stateData = state || trade.state_data || {};
+    const layMatchedAt = Date.now();
+    let finalExposureTimeSeconds = exposureTimeSeconds;
+    
+    if (finalExposureTimeSeconds == null && stateData.position_entered_at) {
+      const backMatchedAt = stateData.position_entered_at;
+      // Use actual kickoff time if available, fallback to scheduled kickoff
+      const actualKickoffTime = stateData.actual_kickoff_time || 0;
+      const scheduledKickoffTime = trade.kickoff_at ? new Date(trade.kickoff_at).getTime() : 0;
+      const kickoffTime = actualKickoffTime || scheduledKickoffTime;
+      
+      // Exposure starts from whichever is later: back matched or kickoff
+      const exposureStartTime = Math.max(backMatchedAt, kickoffTime);
+      finalExposureTimeSeconds = Math.max(0, Math.floor((layMatchedAt - exposureStartTime) / 1000));
+      
+      this.logger.log(`[strategy:epl_under25]   Exposure: ${finalExposureTimeSeconds}s (back matched: ${new Date(backMatchedAt).toISOString()}, kickoff: ${kickoffTime ? new Date(kickoffTime).toISOString() : 'N/A'} ${actualKickoffTime ? '(actual)' : '(scheduled)'}, lay matched: ${new Date(layMatchedAt).toISOString()})`);
+    }
+
+    // Initialize shadow monitoring state for post-trade analytics
+    // CRITICAL: Preserve min_post_entry_price from live MONITORING phase (don't reset to null)
+    // CRITICAL: Preserve goal_detected_during_live_trade flag to freeze min price in shadow monitor
+    const monitorState = {
+      ...state,
+      phase: 'POST_TRADE_MONITOR',
+      is_shadow_trade: false,  // This is a completed trade, not a skipped one
+      exit_reason: additionalPatch.last_error || 'TRADE_SETTLED',
+      realised_pnl: realised,
+      monitor_started_at: Date.now(),
+      // Preserve min_post_entry_price from live tracking (if available)
+      // Only reset to null if it was never tracked during MONITORING phase
+      min_post_entry_price: state.min_post_entry_price || null,
+      // Preserve goal flag to prevent corruption from post-goal drift
+      goal_detected_during_live_trade: state.goal_detected_during_live_trade || false,
+      min_price_frozen_at_goal: state.min_price_frozen_at_goal || null,
+      last_monitor_poll: 0,  // Allow immediate first poll
+    };
+    
+    // Log goal freeze status for audit trail
+    if (state.goal_detected_during_live_trade) {
+      this.logger.log(`[strategy:epl_under25]   🔒 Goal flag preserved: min_post_entry_price=${state.min_post_entry_price} FROZEN (will not update in shadow monitoring)`);
+    }
+
     const patch = {
-      status: 'hedged',
+      status: 'post_trade_monitor',  // Transition to shadow monitoring
       lay_matched_size: layStake || null,
       realised_pnl: realised,  // May be null if lay data missing
       pnl: realised,
       settled_at: new Date().toISOString(),
       total_stake: backStake + layStake,
-      state_data: state,
+      exposure_time_seconds: finalExposureTimeSeconds,
+      state_data: monitorState,
       ...additionalPatch,
     };
 
@@ -2837,6 +3191,13 @@ class EplUnder25Strategy {
       this.logger.log(`[strategy:epl_under25] ⚠️ P&L UNKNOWN (incomplete data) on ${eventName}`);
     }
     this.logger.log(`[strategy:epl_under25]   Back: £${backStake.toFixed(2)} @ ${backPrice} | Lay: £${layStake.toFixed(2)} @ ${layPrice}`);
+    
+    // Log min_post_entry_price preservation (data quality check)
+    if (state.min_post_entry_price) {
+      this.logger.log(`[strategy:epl_under25]   📊 Min price captured: ${state.min_post_entry_price} (preserved from live tracking)`);
+    } else {
+      this.logger.log(`[strategy:epl_under25]   ⚠️ Min price: NOT CAPTURED (trade settled before tracking initialized)`);
+    }
 
     await this.logEvent(trade.id, 'TRADE_SETTLED', {
       realised_pnl: realised,
@@ -2845,6 +3206,11 @@ class EplUnder25Strategy {
       lay_stake: layStake,
       lay_price: layPrice,
       commission,
+      exposure_time_seconds: finalExposureTimeSeconds,
+      min_post_entry_price: state.min_post_entry_price || null,
+      time_at_min_price: state.time_at_min_price || null,
+      goal_detected_during_live_trade: state.goal_detected_during_live_trade || false,
+      min_price_frozen_at_goal: state.min_price_frozen_at_goal || null,
       outcome: realised === null ? 'unknown' : (realised >= 0 ? 'profit' : 'loss'),
     });
 
@@ -2853,6 +3219,239 @@ class EplUnder25Strategy {
     trade.realised_pnl = realised;
     trade.pnl = realised;
     trade.total_stake = backStake + layStake;
+  }
+
+  // --- Post-Trade Shadow Monitoring ---
+
+  /**
+   * POST_TRADE_MONITOR handler.
+   * Tracks min price after trade completion/skip for analytics.
+   * 
+   * PERFORMANCE: 60-second throttle to prevent API exhaustion during goal spikes.
+   * Shadow trades are low priority - real trades always execute first.
+   * 
+   * DATA INTEGRITY: 
+   * - Inherits min_post_entry_price from live MONITORING phase if available
+   * - If goal occurred during live trading, starts with pre-goal minimum (preserved)
+   * - If goal occurs during shadow monitoring, freezes min at pre-goal value (90s confirmation)
+   * - This prevents end-of-game drift (1.01) from overwriting valid minimums
+   * 
+   * Stop conditions:
+   * - 120 mins elapsed since monitoring started
+   * - Market closed
+   */
+  async handlePostTradeMonitor(trade, now) {
+    const state = trade.state_data || {};
+    const eventName = trade.event_name || trade.fixture_name || trade.event_id || 'Unknown';
+    
+    // --- Throttle Gate: 60-second cooldown ---
+    // During goal spikes, main loop runs every few seconds.
+    // Shadow monitoring doesn't need that resolution - 60s is sufficient.
+    const SHADOW_POLL_COOLDOWN_MS = 60000;
+    const pollCheckTime = Date.now();
+    
+    if (state.last_monitor_poll && (pollCheckTime - state.last_monitor_poll) < SHADOW_POLL_COOLDOWN_MS) {
+      // Throttled - skip this poll cycle
+      return;
+    }
+    
+    // Update last poll time (will be persisted at end)
+    state.last_monitor_poll = pollCheckTime;
+    
+    // --- Stop Condition: Max duration (120 mins) ---
+    const MAX_MONITOR_DURATION_MS = 120 * 60 * 1000;
+    if (state.monitor_started_at && (pollCheckTime - state.monitor_started_at) > MAX_MONITOR_DURATION_MS) {
+      this.logger.log(`[strategy:epl_under25] Shadow monitoring timeout (120 mins) for ${eventName} - finalizing`);
+      await this.finalizeShadowMonitoring(trade, state, 'MAX_DURATION_REACHED');
+      return;
+    }
+    
+    // --- Get market data ---
+    const sessionToken = await this.requireSessionWithRetry('shadow-monitor');
+    const market = await this.ensureMarket(trade, sessionToken);
+    if (!market) {
+      this.logger.warn(`[strategy:epl_under25] Shadow monitor: no market for ${eventName}`);
+      return;
+    }
+    
+    const book = await this.getMarketBookSafe(market.marketId, sessionToken, 'shadow-monitor');
+    
+    // --- Stop Condition: Market closed ---
+    if (book && book.status === 'CLOSED') {
+      this.logger.log(`[strategy:epl_under25] Market closed for ${eventName} - finalizing shadow monitoring`);
+      await this.finalizeShadowMonitoring(trade, state, 'MARKET_CLOSED');
+      return;
+    }
+    
+    // --- Track min price (lowest lay price = best potential profit) ---
+    const runner = book?.runners?.find(r => r.selectionId == market.selectionId);
+    const currentLayPrice = runner?.ex?.availableToLay?.[0]?.price;
+    
+    if (currentLayPrice) {
+      // --- FREEZE ON GOAL: Skip updates if goal was detected during live trade OR confirmed in shadow monitoring ---
+      if (state.goal_detected_during_live_trade) {
+        // Goal occurred during active trade (MONITORING phase) - min price already captured before goal
+        // Do NOT update min_post_entry_price to prevent corruption from post-goal drift
+        this.logger.log(`[strategy:epl_under25] 🔒 Min price FROZEN for ${eventName} (goal during live trade) - preserving ${state.min_post_entry_price || 'N/A'}, ignoring current ${currentLayPrice}`);
+        return;
+      }
+      
+      if (state.shadow_goal_detected) {
+        // Goal confirmed during shadow monitoring - min price is frozen at pre-goal value
+        this.logger.log(`[strategy:epl_under25] 🔒 Min price FROZEN for ${eventName} (shadow goal confirmed) - preserving ${state.min_post_entry_price || 'N/A'}, ignoring current ${currentLayPrice}`);
+        return;
+      }
+      
+      // --- Spike Detection: Check for 30% price increase (potential goal) ---
+      const minPrice = state.min_post_entry_price;
+      if (minPrice && currentLayPrice > (minPrice * 1.30)) {
+        // Potential goal spike detected (30% above recorded minimum)
+        const GOAL_CONFIRMATION_WAIT_MS = 90000; // 90 seconds guardrail
+        
+        if (!state.shadow_spike_start_ts) {
+          // First spike detection - start confirmation timer
+          state.shadow_spike_start_ts = pollCheckTime;
+          this.logger.log(`[strategy:epl_under25] 🎯 Shadow spike detected: ${currentLayPrice} > ${(minPrice * 1.30).toFixed(2)} (30% above min) for ${eventName} - waiting 90s to confirm goal`);
+        } else {
+          // Spike already in progress - check if confirmation period elapsed
+          const spikeElapsed = pollCheckTime - state.shadow_spike_start_ts;
+          
+          if (spikeElapsed >= GOAL_CONFIRMATION_WAIT_MS) {
+            // Spike persisted for 90 seconds - confirm goal and FREEZE min price
+            state.shadow_goal_detected = true;
+            state.shadow_goal_detected_at = pollCheckTime;
+            this.logger.log(`[strategy:epl_under25] 🎯 SHADOW GOAL CONFIRMED (spike persisted 90s) for ${eventName} - FREEZING min_post_entry_price at ${minPrice}`);
+            
+            await this.logEvent(trade.id, 'SHADOW_GOAL_DETECTED', {
+              min_price_frozen_at: minPrice,
+              spike_price: currentLayPrice,
+              spike_pct: ((currentLayPrice - minPrice) / minPrice * 100).toFixed(1),
+              timestamp: new Date().toISOString(),
+            });
+          } else {
+            this.logger.log(`[strategy:epl_under25] Shadow spike ongoing: ${(spikeElapsed / 1000).toFixed(0)}s / ${(GOAL_CONFIRMATION_WAIT_MS / 1000)}s for ${eventName}`);
+          }
+        }
+      } else {
+        // Price is normal (no spike) - reset spike tracking if it was active
+        if (state.shadow_spike_start_ts) {
+          this.logger.log(`[strategy:epl_under25] Shadow spike reset (false alarm) for ${eventName}`);
+          state.shadow_spike_start_ts = null;
+        }
+        
+        // Update min price if lower (only when no goal detected)
+        if (state.min_post_entry_price === null || currentLayPrice < state.min_post_entry_price) {
+          state.min_post_entry_price = currentLayPrice;
+          state.time_at_min_price = Math.floor((pollCheckTime - (state.monitor_started_at || pollCheckTime)) / 1000);
+          this.logger.log(`[strategy:epl_under25] 📊 Shadow min price updated: ${currentLayPrice} for ${eventName}`);
+        }
+      }
+    }
+    
+    // --- Persist state (fire-and-forget style - don't await in hot path) ---
+    // Using setImmediate to avoid blocking the main loop
+    setImmediate(async () => {
+      try {
+        await this.updateTrade(trade.id, {
+          state_data: state,
+          min_post_entry_price: state.min_post_entry_price,
+        });
+      } catch (err) {
+        this.logger.warn(`[strategy:epl_under25] Shadow monitor state persist failed: ${err.message}`);
+      }
+    });
+  }
+
+  /**
+   * Finalize shadow monitoring and persist final analytics data.
+   */
+  async finalizeShadowMonitoring(trade, state, reason) {
+    const eventName = trade.event_name || trade.fixture_name || trade.event_id || 'Unknown';
+    
+    this.logger.log(`[strategy:epl_under25] Finalizing shadow monitoring for ${eventName} (reason: ${reason})`);
+    
+    state.phase = 'COMPLETED';
+    state.monitor_ended_at = Date.now();
+    state.monitor_end_reason = reason;
+    
+    const updatePayload = {
+      status: 'hedged',  // Final status for completed trades
+      state_data: state,
+      min_post_entry_price: state.min_post_entry_price,
+    };
+    
+    // For shadow trades (skipped), use 'cancelled' as final status
+    if (state.is_shadow_trade) {
+      updatePayload.status = 'cancelled';
+      updatePayload.theoretical_entry_price = state.theoretical_entry_price;
+    }
+    
+    await this.updateTrade(trade.id, updatePayload);
+    
+    await this.logEvent(trade.id, 'SHADOW_MONITORING_COMPLETED', {
+      reason,
+      is_shadow_trade: state.is_shadow_trade,
+      skip_reason: state.skip_reason || null,
+      theoretical_entry_price: state.theoretical_entry_price || null,
+      min_post_entry_price: state.min_post_entry_price,
+      time_at_min_price: state.time_at_min_price,
+      goal_detected_during_live_trade: state.goal_detected_during_live_trade || false,
+      min_price_frozen_at_goal: state.min_price_frozen_at_goal || null,
+      shadow_goal_detected: state.shadow_goal_detected || false,
+      monitor_duration_seconds: state.monitor_started_at 
+        ? Math.floor((Date.now() - state.monitor_started_at) / 1000) 
+        : null,
+      timestamp: new Date().toISOString(),
+    });
+    
+    const tradeType = state.is_shadow_trade ? 'SHADOW' : 'COMPLETED';
+    this.logger.log(`[strategy:epl_under25] 📊 Shadow monitoring complete [${tradeType}]: ${eventName} | min_price=${state.min_post_entry_price || 'N/A'}`);
+  }
+
+  /**
+   * Capture back_price_at_kickoff 1 minute before kickoff (data logging only).
+   * This is purely for post-trade analysis - does NOT affect strategy logic.
+   * Runs for ALL active trades regardless of status.
+   */
+  async captureBackPriceAtKickoff(trade, now) {
+    // Skip if already captured
+    if (trade.back_price_at_kickoff) return;
+    
+    const kickoff = trade.kickoff_at ? new Date(trade.kickoff_at) : null;
+    if (!kickoff) return;
+    
+    const minsToKickoff = (kickoff.getTime() - now.getTime()) / 60000;
+    
+    // Only capture in the window: 1 minute before kickoff (between 0 and 1 min to kick)
+    if (minsToKickoff > 1 || minsToKickoff <= 0) return;
+    
+    const eventName = trade.event_name || trade.fixture_name || trade.event_id || 'Unknown';
+    
+    try {
+      const sessionToken = await this.requireSessionWithRetry('back-price-at-kickoff');
+      const market = await this.ensureMarket(trade, sessionToken);
+      if (!market) return;
+      
+      const book = await this.getMarketBookSafe(market.marketId, sessionToken, 'back-price-at-kickoff');
+      const runner = book?.runners?.find(r => r.selectionId == market.selectionId);
+      const backPriceAtKickoff = runner?.ex?.availableToBack?.[0]?.price || null;
+      
+      if (backPriceAtKickoff) {
+        this.logger.log(`[strategy:epl_under25] 📊 BACK PRICE AT KICKOFF captured: ${backPriceAtKickoff} for ${eventName} (${minsToKickoff.toFixed(1)} mins to kick, status: ${trade.status})`);
+        await this.updateTrade(trade.id, { back_price_at_kickoff: backPriceAtKickoff });
+        trade.back_price_at_kickoff = backPriceAtKickoff; // Update local object to prevent re-capture
+        await this.logEvent(trade.id, 'BACK_PRICE_AT_KICKOFF', {
+          back_price_at_kickoff: backPriceAtKickoff,
+          mins_to_kickoff: minsToKickoff,
+          trade_status: trade.status,
+          timestamp: new Date().toISOString(),
+        });
+      } else {
+        this.logger.warn(`[strategy:epl_under25] ⚠️ Could not capture back_price_at_kickoff for ${eventName} (no back price available)`);
+      }
+    } catch (err) {
+      this.logger.warn(`[strategy:epl_under25] Failed to capture back_price_at_kickoff for ${eventName}: ${err.message}`);
+    }
   }
 
   async updateTrade(id, patch) {

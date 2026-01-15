@@ -41,6 +41,7 @@ const {
 const { roundToBetfairTick, findBestMatch } = require('./lib/betfair-utils');
 const { createEplUnder25Strategy } = require('./lib/strategies/epl-under25');
 const { createEplUnder25GoalReactStrategy } = require('./lib/strategies/epl-under25-goalreact');
+const { createEplOver25BreakoutStrategy } = require('./lib/strategies/epl-over25-breakout');
 
 initializeSessionManager({ logger: console });
 
@@ -184,6 +185,17 @@ async function main() {
       });
     } else {
       console.log('[strategy:epl_under25_goalreact] disabled (ENABLE_EPL_UNDER25_GOALREACT_STRATEGY != true)');
+    }
+
+    // Strategy 3: Over 2.5 Breakout (wake at kickoff, detect 1st goal, back Over 2.5)
+    let over25BreakoutStrategy = null;
+    if (process.env.ENABLE_EPL_OVER25_BREAKOUT_STRATEGY === 'true') {
+      over25BreakoutStrategy = createEplOver25BreakoutStrategy(strategyDeps);
+      over25BreakoutStrategy.start().catch((err) => {
+        console.error('[strategy:epl_over25_breakout] failed to start:', err && err.message ? err.message : err);
+      });
+    } else {
+      console.log('[strategy:epl_over25_breakout] disabled (ENABLE_EPL_OVER25_BREAKOUT_STRATEGY != true)');
     }
 
     const seenCandidateIds = [];
@@ -503,8 +515,13 @@ async function main() {
           console.warn('[strategy:epl_under25_goalreact] stop error:', err && err.message ? err.message : err);
         });
       }
+      if (over25BreakoutStrategy) {
+        over25BreakoutStrategy.stop().catch((err) => {
+          console.warn('[strategy:epl_over25_breakout] stop error:', err && err.message ? err.message : err);
+        });
+      }
       server.close();
-    } catch {}
+    } catch { }
     process.exit(0);
   };
 

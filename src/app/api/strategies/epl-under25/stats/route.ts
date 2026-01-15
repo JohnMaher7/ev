@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { config } from '@/lib/config';
 import { supabaseAdmin } from '@/lib/supabase';
 
-type StrategyKey = typeof config.strategies.eplUnder25.key | typeof config.strategies.eplUnder25GoalReact.key;
+type StrategyKey = typeof config.strategies.eplUnder25.key | typeof config.strategies.eplUnder25GoalReact.key | typeof config.strategies.eplOver25Breakout.key;
 
 type StrategyTradeRow = {
   id: string;
@@ -25,7 +25,7 @@ type StatsResponse = {
   competitions: Array<{ name: string; pnl: number; trades: number; staked: number }>;
 };
 
-const STRATEGY_KEYS: StrategyKey[] = [config.strategies.eplUnder25.key, config.strategies.eplUnder25GoalReact.key];
+const STRATEGY_KEYS: StrategyKey[] = [config.strategies.eplUnder25.key, config.strategies.eplUnder25GoalReact.key, config.strategies.eplOver25Breakout.key];
 const SETTLED_STATUSES = ['hedged', 'completed'] as const;
 
 function chunk<T>(items: T[], size: number): T[][] {
@@ -192,6 +192,10 @@ export async function GET(request: NextRequest) {
     );
   }
 }
+
+
+
+
 
 
 
